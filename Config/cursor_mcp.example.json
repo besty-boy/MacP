@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "macp": {
+      "command": "/Applications/MacP.app/Contents/MacOS/MacP",
+      "args": ["--stdio"]
+    }
+  }
+}

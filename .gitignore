@@ -1,0 +1,8 @@
+.DS_Store
+.build/
+.swiftpm/
+Packages/MacPCore/.build/
+Packages/MacPCore/.swiftpm/
+DerivedData/
+*.xcuserstate
+xcuserdata/

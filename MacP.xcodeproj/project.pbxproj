@@ -1,0 +1,383 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		BB0000010000000000000001 /* MacPCore in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000020000000000000001 /* MacPCore */; };
+		BB0000020000000000000001 /* MacPMain.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000010000000000000001 /* MacPMain.swift */; };
+		BB0000030000000000000001 /* MacPApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000020000000000000001 /* MacPApp.swift */; };
+		BB0000040000000000000001 /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000030000000000000001 /* AppState.swift */; };
+		BB0000050000000000000001 /* NativePermissionPrompter.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000040000000000000001 /* NativePermissionPrompter.swift */; };
+		BB0000060000000000000001 /* DashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000050000000000000001 /* DashboardView.swift */; };
+		BB0000070000000000000001 /* BentoCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000060000000000000001 /* BentoCard.swift */; };
+		BB0000080000000000000001 /* StatusHeaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000070000000000000001 /* StatusHeaderView.swift */; };
+		BB0000090000000000000001 /* ToolToggleTile.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000080000000000000001 /* ToolToggleTile.swift */; };
+		BB0000100000000000000001 /* ActivityFeedCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000090000000000000001 /* ActivityFeedCard.swift */; };
+		BB0000110000000000000001 /* AuditLogSheetView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000100000000000000001 /* AuditLogSheetView.swift */; };
+		BB0000120000000000000001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = CC0000110000000000000001 /* Assets.xcassets */; };
+		BB0000130000000000000001 /* MCPClientConfigManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000140000000000000001 /* MCPClientConfigManager.swift */; };
+		BB0000140000000000000001 /* LaunchAtLoginManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000150000000000000001 /* LaunchAtLoginManager.swift */; };
+		BB0000150000000000000001 /* TelemetryBentoGrid.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000160000000000000001 /* TelemetryBentoGrid.swift */; };
+		BB0000160000000000000001 /* ClientsSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000170000000000000001 /* ClientsSettingsView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		CC0000000000000000000001 /* MacP.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MacP.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		CC0000010000000000000001 /* MacPMain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacPMain.swift; sourceTree = "<group>"; };
+		CC0000020000000000000001 /* MacPApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacPApp.swift; sourceTree = "<group>"; };
+		CC0000030000000000000001 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
+		CC0000040000000000000001 /* NativePermissionPrompter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePermissionPrompter.swift; sourceTree = "<group>"; };
+		CC0000050000000000000001 /* DashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardView.swift; sourceTree = "<group>"; };
+		CC0000060000000000000001 /* BentoCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BentoCard.swift; sourceTree = "<group>"; };
+		CC0000070000000000000001 /* StatusHeaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusHeaderView.swift; sourceTree = "<group>"; };
+		CC0000080000000000000001 /* ToolToggleTile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolToggleTile.swift; sourceTree = "<group>"; };
+		CC0000090000000000000001 /* ActivityFeedCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityFeedCard.swift; sourceTree = "<group>"; };
+		CC0000100000000000000001 /* AuditLogSheetView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuditLogSheetView.swift; sourceTree = "<group>"; };
+		CC0000110000000000000001 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		CC0000120000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		CC0000130000000000000001 /* MacP.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = MacP.entitlements; sourceTree = "<group>"; };
+		CC0000140000000000000001 /* MCPClientConfigManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPClientConfigManager.swift; sourceTree = "<group>"; };
+		CC0000150000000000000001 /* LaunchAtLoginManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchAtLoginManager.swift; sourceTree = "<group>"; };
+		CC0000160000000000000001 /* TelemetryBentoGrid.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryBentoGrid.swift; sourceTree = "<group>"; };
+		CC0000170000000000000001 /* ClientsSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientsSettingsView.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		DD0000010000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BB0000010000000000000001 /* MacPCore in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		EE0000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				EE0000010000000000000001 /* MacPApp */,
+				EE0000080000000000000001 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		EE0000010000000000000001 /* MacPApp */ = {
+			isa = PBXGroup;
+			children = (
+				EE0000020000000000000001 /* Entry */,
+				EE0000030000000000000001 /* App */,
+				EE0000040000000000000001 /* Security */,
+				EE0000090000000000000001 /* Services */,
+				EE0000050000000000000001 /* Views */,
+				EE0000070000000000000001 /* Resources */,
+				CC0000110000000000000001 /* Assets.xcassets */,
+			);
+			path = MacPApp;
+			sourceTree = "<group>";
+		};
+		EE0000020000000000000001 /* Entry */ = {
+			isa = PBXGroup;
+			children = (
+				CC0000010000000000000001 /* MacPMain.swift */,
+			);
+			path = Entry;
+			sourceTree = "<group>";
+		};
+		EE0000030000000000000001 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				CC0000020000000000000001 /* MacPApp.swift */,
+				CC0000030000000000000001 /* AppState.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		EE0000040000000000000001 /* Security */ = {
+			isa = PBXGroup;
+			children = (
+				CC0000040000000000000001 /* NativePermissionPrompter.swift */,
+			);
+			path = Security;
+			sourceTree = "<group>";
+		};
+		EE0000090000000000000001 /* Services */ = {
+			isa = PBXGroup;
+			children = (
+				CC0000140000000000000001 /* MCPClientConfigManager.swift */,
+				CC0000150000000000000001 /* LaunchAtLoginManager.swift */,
+			);
+			path = Services;
+			sourceTree = "<group>";
+		};
+		EE0000050000000000000001 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				CC0000050000000000000001 /* DashboardView.swift */,
+				EE0000060000000000000001 /* Components */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		EE0000060000000000000001 /* Components */ = {
+			isa = PBXGroup;
+			children = (
+				CC0000060000000000000001 /* BentoCard.swift */,
+				CC0000070000000000000001 /* StatusHeaderView.swift */,
+				CC0000160000000000000001 /* TelemetryBentoGrid.swift */,
+				CC0000080000000000000001 /* ToolToggleTile.swift */,
+				CC0000170000000000000001 /* ClientsSettingsView.swift */,
+				CC0000090000000000000001 /* ActivityFeedCard.swift */,
+				CC0000100000000000000001 /* AuditLogSheetView.swift */,
+			);
+			path = Components;
+			sourceTree = "<group>";
+		};
+		EE0000070000000000000001 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				CC0000120000000000000001 /* Info.plist */,
+				CC0000130000000000000001 /* MacP.entitlements */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		EE0000080000000000000001 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				CC0000000000000000000001 /* MacP.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		FF0000010000000000000001 /* MacP */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FF0000040000000000000001 /* Build configuration list for PBXNativeTarget "MacP" */;
+			buildPhases = (
+				FF0000020000000000000001 /* Sources */,
+				DD0000010000000000000001 /* Frameworks */,
+				FF0000030000000000000001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MacP;
+			packageProductDependencies = (
+				AA0000020000000000000001 /* MacPCore */,
+			);
+			productName = MacP;
+			productReference = CC0000000000000000000001 /* MacP.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		FF0000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					FF0000010000000000000001 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+				};
+			};
+			buildConfigurationList = FF0000050000000000000001 /* Build configuration list for PBXProject "MacP" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = fr;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				fr,
+				en,
+				Base,
+			);
+			mainGroup = EE0000000000000000000001;
+			packageReferences = (
+				AA0000010000000000000001 /* XCLocalSwiftPackageReference "Packages/MacPCore" */,
+			);
+			productRefGroup = EE0000080000000000000001 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				FF0000010000000000000001 /* MacP */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		FF0000030000000000000001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BB0000120000000000000001 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		FF0000020000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BB0000020000000000000001 /* MacPMain.swift in Sources */,
+				BB0000030000000000000001 /* MacPApp.swift in Sources */,
+				BB0000040000000000000001 /* AppState.swift in Sources */,
+				BB0000050000000000000001 /* NativePermissionPrompter.swift in Sources */,
+				BB0000130000000000000001 /* MCPClientConfigManager.swift in Sources */,
+				BB0000140000000000000001 /* LaunchAtLoginManager.swift in Sources */,
+				BB0000060000000000000001 /* DashboardView.swift in Sources */,
+				BB0000070000000000000001 /* BentoCard.swift in Sources */,
+				BB0000080000000000000001 /* StatusHeaderView.swift in Sources */,
+				BB0000150000000000000001 /* TelemetryBentoGrid.swift in Sources */,
+				BB0000090000000000000001 /* ToolToggleTile.swift in Sources */,
+				BB0000160000000000000001 /* ClientsSettingsView.swift in Sources */,
+				BB0000100000000000000001 /* ActivityFeedCard.swift in Sources */,
+				BB0000110000000000000001 /* AuditLogSheetView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		FF0000100000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		FF0000110000000000000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		FF0000120000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = MacPApp/Resources/MacP.entitlements;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 2;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = MacPApp/Resources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 2.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.macp.bridge;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		FF0000130000000000000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = MacPApp/Resources/MacP.entitlements;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 2;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = MacPApp/Resources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 2.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.macp.bridge;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		FF0000040000000000000001 /* Build configuration list for PBXNativeTarget "MacP" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FF0000120000000000000001 /* Debug */,
+				FF0000130000000000000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		FF0000050000000000000001 /* Build configuration list for PBXProject "MacP" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FF0000100000000000000001 /* Debug */,
+				FF0000110000000000000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		AA0000010000000000000001 /* XCLocalSwiftPackageReference "Packages/MacPCore" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/MacPCore;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		AA0000020000000000000001 /* MacPCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA0000010000000000000001 /* XCLocalSwiftPackageReference "Packages/MacPCore" */;
+			productName = MacPCore;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = FF0000000000000000000001 /* Project object */;
+}
