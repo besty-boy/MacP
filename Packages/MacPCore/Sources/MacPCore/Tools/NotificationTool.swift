@@ -7,7 +7,7 @@ public struct NotificationTool: MCPTool {
     public let shortSubtitle = "Bannière macOS native"
     public let symbolName = "bell.badge"
     public let category: ToolCategory = .productivity
-    public let description = "Displays a native macOS notification banner (title, message, optional subtitle and sound)."
+    public let description = "Displays a native macOS notification banner (title, message, optional subtitle/sound)."
     public let sensitivity: ToolSensitivity = .sensitive
     public let permissionReason = "Un client IA souhaite afficher une notification macOS sur votre écran."
 
@@ -33,15 +33,15 @@ public struct NotificationTool: MCPTool {
                 ],
                 "message": [
                     "type": "string",
-                    "description": "Main notification body text."
+                    "description": "Notification body text."
                 ],
                 "subtitle": [
                     "type": "string",
-                    "description": "Optional subtitle displayed beneath the title."
+                    "description": "Optional subtitle."
                 ],
                 "sound": [
                     "type": "string",
-                    "description": "Optional macOS system sound name (e.g. 'Glass', 'Ping', 'Pop', 'Hero')."
+                    "description": "Optional system sound (e.g. 'Glass', 'Ping', 'Pop')."
                 ]
             ],
             "required": ["title", "message"],
@@ -68,7 +68,7 @@ public struct NotificationTool: MCPTool {
         let subtitle = arguments["subtitle"]?.stringValue ?? ""
         let sound = arguments["sound"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
-        // Pass all user-supplied text strictly through `argv` to avoid any script injection.
+        // Pass all user-supplied text strictly through `argv` to prevent script injection.
         let script: String
         let scriptArgs: [String]
         if sound.isEmpty {

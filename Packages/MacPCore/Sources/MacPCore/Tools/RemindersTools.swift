@@ -1,45 +1,14 @@
 import EventKit
 import Foundation
 
-enum RemindersAccessHelper {
-    enum Result: Sendable {
-        case granted
-        case denied(String)
-    }
-
-    static func ensureFullAccess() async -> Result {
-        let status = EKEventStore.authorizationStatus(for: .reminder)
-        switch status {
-        case .fullAccess:
-            return .granted
-        case .notDetermined:
-            do {
-                let store = EKEventStore()
-                let granted = try await store.requestFullAccessToReminders()
-                return granted
-                    ? .granted
-                    : .denied("Accès aux Rappels macOS refusé par l'utilisateur.")
-            } catch {
-                return .denied("Erreur lors de la demande d'accès aux Rappels : \(error.localizedDescription)")
-            }
-        case .writeOnly:
-            return .denied("Accès complet requis pour les Rappels dans Réglages Système > Confidentialité et sécurité > Rappels.")
-        case .denied, .restricted:
-            return .denied("Accès aux Rappels macOS refusé ou restreint. Autorisez MacP dans Réglages Système > Confidentialité et sécurité > Rappels.")
-        @unknown default:
-            return .denied("Statut d'autorisation EventKit (Rappels) inconnu.")
-        }
-    }
-}
-
-/// Lists macOS Reminders via native `EventKit`.
+/// Lists macOS Reminders via native `EventKit` using the shared `EKEventStore`.
 public struct ListRemindersTool: MCPTool {
     public let name = "macos_list_reminders"
     public let displayName = "Lire Rappels"
     public let shortSubtitle = "Tâches EventKit"
     public let symbolName = "checklist"
     public let category: ToolCategory = .productivity
-    public let description = "Lists macOS Reminders (incomplete by default, or filtered by list name) using EventKit."
+    public let description = "Lists macOS Reminders (incomplete by default, optionally filtered by list) via EventKit."
     public let sensitivity: ToolSensitivity = .sensitive
     public let permissionReason = "Un client IA souhaite lire vos listes de Rappels macOS."
 
@@ -61,15 +30,15 @@ public struct ListRemindersTool: MCPTool {
             "properties": [
                 "list_name": [
                     "type": "string",
-                    "description": "Optional reminder list title filter (case-insensitive)."
+                    "description": "Optional list title filter (case-insensitive)."
                 ],
                 "include_completed": [
                     "type": "boolean",
-                    "description": "Whether to include completed reminders (default: false)."
+                    "description": "Include completed items (default: false)."
                 ],
                 "limit": [
                     "type": "integer",
-                    "description": "Maximum number of reminders to return (1 to 200, default: 50).",
+                    "description": "Max items to return (1-200, default: 50).",
                     "minimum": 1,
                     "maximum": 200
                 ]
@@ -99,7 +68,7 @@ public struct ListRemindersTool: MCPTool {
         let limit = min(max(arguments["limit"]?.intValue ?? 50, 1), 200)
         let listFilter = arguments["list_name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        switch await RemindersAccessHelper.ensureFullAccess() {
+        switch await SharedEventKitStore.shared.ensureFullAccess(for: .reminder) {
         case .granted:
             break
         case let .denied(message):
@@ -120,7 +89,7 @@ public struct ListRemindersTool: MCPTool {
         limit: Int
     ) async -> ListPayload {
         await withCheckedContinuation { continuation in
-            let store = EKEventStore()
+            let store = SharedEventKitStore.shared.eventStore
             let allLists = store.calendars(for: .reminder)
             let allListNames = allLists.map(\.title).sorted()
 
@@ -147,16 +116,13 @@ public struct ListRemindersTool: MCPTool {
                 )
 
             store.fetchReminders(matching: predicate) { fetched in
-                let iso = ISO8601DateFormatter()
-                iso.formatOptions = [.withInternetDateTime]
-
                 let items = (fetched ?? [])
                     .prefix(limit)
                     .map { reminder in
-                        let dueStr = reminder.dueDateComponents?.date.map { iso.string(from: $0) }
+                        let dueStr = reminder.dueDateComponents?.date.map { ISO8601Codec.format($0) }
                         let trimmedNotes: String?
                         if let notes = reminder.notes, !notes.isEmpty {
-                            trimmedNotes = notes.count > 300 ? String(notes.prefix(300)) + "..." : notes
+                            trimmedNotes = notes.count > 300 ? String(notes.prefix(297)) + "..." : notes
                         } else {
                             trimmedNotes = nil
                         }
@@ -189,7 +155,7 @@ public struct CreateReminderTool: MCPTool {
     public let shortSubtitle = "Ajouter une tâche"
     public let symbolName = "checklist.checked"
     public let category: ToolCategory = .productivity
-    public let description = "Creates a new reminder in macOS Reminders via EventKit."
+    public let description = "Creates a new macOS Reminder via EventKit."
     public let sensitivity: ToolSensitivity = .sensitive
     public let permissionReason = "Un client IA souhaite créer un nouveau Rappel sur votre Mac."
 
@@ -211,23 +177,23 @@ public struct CreateReminderTool: MCPTool {
             "properties": [
                 "title": [
                     "type": "string",
-                    "description": "Title of the reminder."
+                    "description": "Reminder title."
                 ],
                 "list_name": [
                     "type": "string",
-                    "description": "Optional reminder list name. Defaults to the default Reminders list."
+                    "description": "Optional list name (defaults to default list)."
                 ],
                 "due_iso": [
                     "type": "string",
-                    "description": "Optional due date/time in ISO-8601 format."
+                    "description": "Optional due ISO-8601 date/time."
                 ],
                 "notes": [
                     "type": "string",
-                    "description": "Optional notes for the reminder."
+                    "description": "Optional notes."
                 ],
                 "priority": [
                     "type": "integer",
-                    "description": "Optional priority (0 = none, 1 = high, 5 = medium, 9 = low).",
+                    "description": "Priority: 0=none, 1=high, 5=medium, 9=low.",
                     "minimum": 0,
                     "maximum": 9
                 ]
@@ -253,24 +219,24 @@ public struct CreateReminderTool: MCPTool {
 
         let listName = arguments["list_name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let notes = arguments["notes"]?.stringValue
-        let priority = arguments["priority"]?.intValue ?? 0
+        let priority = min(max(arguments["priority"]?.intValue ?? 0, 0), 9)
 
         var dueDate: Date?
         if let dueStr = arguments["due_iso"]?.stringValue, !dueStr.isEmpty {
-            guard let parsed = CalendarAccessHelper.parseISO8601(dueStr) else {
+            guard let parsed = ISO8601Codec.parse(dueStr) else {
                 return .failure("Format 'due_iso' invalide. Utilisez un format ISO-8601 (ex: 2026-11-21T09:00:00+01:00).")
             }
             dueDate = parsed
         }
 
-        switch await RemindersAccessHelper.ensureFullAccess() {
+        switch await SharedEventKitStore.shared.ensureFullAccess(for: .reminder) {
         case .granted:
             break
         case let .denied(message):
             return .failure(message)
         }
 
-        let store = EKEventStore()
+        let store = SharedEventKitStore.shared.eventStore
         let targetList: EKCalendar?
         if let listName, !listName.isEmpty {
             targetList = store.calendars(for: .reminder).first {
@@ -301,28 +267,25 @@ public struct CreateReminderTool: MCPTool {
 
         try store.save(reminder, commit: true)
 
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime]
-
         let payload = CreatedPayload(
             created: true,
             id: reminder.calendarItemIdentifier,
             title: title,
             list: resolvedList.title,
-            dueDate: dueDate.map { iso.string(from: $0) }
+            dueDate: dueDate.map { ISO8601Codec.format($0) }
         )
         return .success(try ToolOutputFormatter.encodeJSON(payload))
     }
 }
 
-/// Marks a macOS Reminder as completed by identifier or title via `EventKit`.
+/// Marks a macOS Reminder as completed by O(1) identifier lookup or title via `EventKit`.
 public struct CompleteReminderTool: MCPTool {
     public let name = "macos_complete_reminder"
     public let displayName = "Compléter Rappel"
     public let shortSubtitle = "Cocher une tâche"
     public let symbolName = "checkmark.circle"
     public let category: ToolCategory = .productivity
-    public let description = "Marks an incomplete macOS Reminder as completed by its 'reminder_id' or exact 'title'."
+    public let description = "Marks an incomplete macOS Reminder as completed by 'reminder_id' or exact 'title'."
     public let sensitivity: ToolSensitivity = .sensitive
     public let permissionReason = "Un client IA souhaite marquer un Rappel macOS comme terminé."
 
@@ -344,11 +307,11 @@ public struct CompleteReminderTool: MCPTool {
             "properties": [
                 "reminder_id": [
                     "type": "string",
-                    "description": "Identifier returned by macos_list_reminders."
+                    "description": "ID returned by macos_list_reminders."
                 ],
                 "title": [
                     "type": "string",
-                    "description": "Exact title of the incomplete reminder (used if reminder_id is omitted)."
+                    "description": "Exact title (used if reminder_id omitted)."
                 ]
             ],
             "additionalProperties": false
@@ -370,15 +333,31 @@ public struct CompleteReminderTool: MCPTool {
             return .failure("Fournissez soit 'reminder_id' soit 'title'.")
         }
 
-        switch await RemindersAccessHelper.ensureFullAccess() {
+        switch await SharedEventKitStore.shared.ensureFullAccess(for: .reminder) {
         case .granted:
             break
         case let .denied(message):
             return .failure(message)
         }
 
+        let store = SharedEventKitStore.shared.eventStore
+
+        // O(1) fast path when `reminder_id` is supplied.
+        if let reminderID, !reminderID.isEmpty,
+           let directMatch = store.calendarItem(withIdentifier: reminderID) as? EKReminder {
+            directMatch.isCompleted = true
+            directMatch.completionDate = Date()
+            try store.save(directMatch, commit: true)
+            let payload = CompletedPayload(
+                completed: true,
+                id: directMatch.calendarItemIdentifier,
+                title: directMatch.title ?? "(Sans titre)",
+                list: directMatch.calendar.title
+            )
+            return .success(try ToolOutputFormatter.encodeJSON(payload))
+        }
+
         let outcome: Result<CompletedPayload, Error> = await withCheckedContinuation { continuation in
-            let store = EKEventStore()
             let predicate = store.predicateForIncompleteReminders(
                 withDueDateStarting: nil,
                 ending: nil,

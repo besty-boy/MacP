@@ -4,9 +4,15 @@ import MacPCore
 
 /// Presents a native macOS `NSAlert` consent dialog whenever an AI client invokes
 /// a sensitive or critical macOS tool.
+/// - Displays a scrollable monospace preview when arguments contain scripts or long payloads.
+/// - Restores focus to the previously active app after dismissal so tools like `macos_capture_screen`
+///   capture the user's real active window instead of MacP.
 struct NativePermissionPrompter: PermissionPrompter {
     func requestPermission(for request: ToolPermissionRequest) async -> ToolPermissionDecision {
         await MainActor.run {
+            let previousApp = NSWorkspace.shared.frontmostApplication
+            let selfPID = ProcessInfo.processInfo.processIdentifier
+
             NSApp.activate(ignoringOtherApps: true)
 
             let alert = NSAlert()
@@ -26,18 +32,28 @@ struct NativePermissionPrompter: PermissionPrompter {
                 ? "Action sensible : « \(request.toolDisplayName) »"
                 : "Autoriser « \(request.toolDisplayName) » ?"
 
-            let formattedArgs = request.argumentsSummary.count > 260
-                ? String(request.argumentsSummary.prefix(257)) + "..."
-                : request.argumentsSummary
+            let detail = request.argumentsDetail
+            let needsAccessoryPreview = detail.contains("\n") || detail.count > 120
 
-            alert.informativeText = """
-            \(request.reason)
+            if needsAccessoryPreview {
+                alert.informativeText = """
+                \(request.reason)
 
-            Client IA : \(request.clientName)
-            Outil : \(request.toolName)
-            Paramètres : \(formattedArgs)
-            """
+                Client IA : \(request.clientName)
+                Outil : \(request.toolName)
+                """
+                alert.accessoryView = makeScriptPreviewView(text: detail)
+            } else {
+                alert.informativeText = """
+                \(request.reason)
 
+                Client IA : \(request.clientName)
+                Outil : \(request.toolName)
+                Paramètres : \(detail)
+                """
+            }
+
+            let decision: ToolPermissionDecision
             if isStrict {
                 // Critical / Always-Ask tools never allow permanent caching from the prompt.
                 let allowOnce = alert.addButton(withTitle: "Autoriser cette fois")
@@ -46,7 +62,7 @@ struct NativePermissionPrompter: PermissionPrompter {
                 let deny = alert.addButton(withTitle: "Refuser")
                 deny.keyEquivalent = "\u{1b}"
 
-                return alert.runModal() == .alertFirstButtonReturn ? .allowOnce : .deny
+                decision = alert.runModal() == .alertFirstButtonReturn ? .allowOnce : .deny
             } else {
                 let allowOnce = alert.addButton(withTitle: "Autoriser cette fois")
                 allowOnce.keyEquivalent = "\r"
@@ -62,15 +78,48 @@ struct NativePermissionPrompter: PermissionPrompter {
 
                 switch alert.runModal() {
                 case .alertFirstButtonReturn:
-                    return .allowOnce
+                    decision = .allowOnce
                 case .alertSecondButtonReturn:
-                    return .allowFor15Minutes
+                    decision = .allowFor15Minutes
                 case .alertThirdButtonReturn:
-                    return .allowAlways
+                    decision = .allowAlways
                 default:
-                    return .deny
+                    decision = .deny
                 }
             }
+
+            // Gently restore focus to the previous app so subsequent window captures target it cleanly.
+            if let previousApp, previousApp.processIdentifier != selfPID {
+                previousApp.activate()
+            }
+
+            return decision
         }
+    }
+
+    @MainActor
+    private func makeScriptPreviewView(text: String) -> NSView {
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 380, height: 120))
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.borderType = .bezelBorder
+        scrollView.autohidesScrollers = true
+
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 364, height: 120))
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = true
+        textView.backgroundColor = .textBackgroundColor
+        textView.textColor = .labelColor
+        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.textContainerInset = NSSize(width: 6, height: 6)
+        textView.string = text
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+
+        scrollView.documentView = textView
+        return scrollView
     }
 }

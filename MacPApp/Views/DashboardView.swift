@@ -1,8 +1,8 @@
 import MacPCore
 import SwiftUI
 
-/// Main Menu Bar Popover Dashboard V2: Liquid Glass aesthetic, Bento Grid telemetry,
-/// 17 categorized tools with granular governance, 1-click AI client configurator, and live Activity Feed.
+/// Main Menu Bar Popover Dashboard: Liquid Glass aesthetic, Bento Grid telemetry,
+/// categorized tools with token-economy presets & granular governance, 1-click AI client configurator, and live Activity Feed.
 struct DashboardView: View {
     let appState: AppState
     @Environment(\.openWindow) private var openWindow
@@ -81,6 +81,9 @@ struct DashboardView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
+            .onChange(of: selectedTab) { _, newValue in
+                appState.setOverviewTabSelected(newValue == .overview)
+            }
 
             // Active Tab Content
             switch selectedTab {
@@ -107,8 +110,7 @@ struct DashboardView: View {
                 .controlSize(.small)
 
                 Button {
-                    NSApp.activate(ignoringOtherApps: true)
-                    openWindow(id: "audit-log")
+                    openAuditInspector(selecting: nil)
                 } label: {
                     Label("Journal", systemImage: "doc.text.magnifyingglass")
                         .font(.system(.caption, weight: .medium))
@@ -129,8 +131,16 @@ struct DashboardView: View {
             .padding(.top, 2)
         }
         .padding(16)
-        .frame(width: 444)
+        .frame(width: 448)
         .background(.regularMaterial)
+    }
+
+    private func openAuditInspector(selecting entryID: UUID?) {
+        if let entryID {
+            appState.selectedAuditEntryID = entryID
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        openWindow(id: "audit-log")
     }
 
     // MARK: - Overview Tab
@@ -142,27 +152,66 @@ struct DashboardView: View {
                 snapshot: appState.snapshot,
                 activeToolsCount: appState.activeToolsCount,
                 totalToolsCount: appState.tools.count,
-                resourcesCount: MCPResourceCatalog.defaultEntries.count,
-                promptsCount: MCPPromptCatalog().definitions.count
+                resourcesCount: appState.enabledResourcesCount,
+                promptsCount: appState.promptsCount,
+                estimatedContextTokens: appState.estimatedContextTokens
             )
 
-            ActivityFeedCard(entries: appState.recentEntries) {
-                NSApp.activate(ignoringOtherApps: true)
-                openWindow(id: "audit-log")
-            }
+            ActivityFeedCard(
+                entries: appState.recentEntries,
+                onOpenFullLog: { openAuditInspector(selecting: nil) },
+                onSelectEntry: { entry in openAuditInspector(selecting: entry.id) }
+            )
         }
     }
 
     // MARK: - Tools Tab
 
     private var toolsContent: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 9) {
+            // Token-Economy Preset Bar + Live Context Cost
+            HStack(spacing: 6) {
+                ForEach(ToolPreset.allCases) { preset in
+                    let isActive = (appState.activePreset == preset)
+                    Button {
+                        appState.applyPreset(preset)
+                    } label: {
+                        Text(preset.frenchTitle)
+                            .font(.system(size: 10.5, weight: isActive ? .semibold : .medium))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3.5)
+                            .background(
+                                isActive ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.05),
+                                in: Capsule()
+                            )
+                            .foregroundStyle(isActive ? Color.accentColor : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help(preset.frenchHelp)
+                }
+
+                Spacer(minLength: 4)
+
+                HStack(spacing: 3) {
+                    Image(systemName: "leaf.fill")
+                        .font(.system(size: 9))
+                    Text("~\(appState.estimatedContextTokens) tok/tour")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .monospacedDigit()
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(Color.green.opacity(0.12), in: Capsule())
+                .foregroundStyle(.green)
+                .help("Empreinte estimée de la liste d'outils envoyée au modèle IA à chaque tour")
+            }
+
             // Search box
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
-                TextField("Filtrer les 17 outils macOS...", text: $toolSearchText)
+                TextField("Filtrer les \(appState.tools.count) outils macOS...", text: $toolSearchText)
                     .textFieldStyle(.plain)
                     .font(.system(.caption))
                 if !toolSearchText.isEmpty {
@@ -180,12 +229,18 @@ struct DashboardView: View {
             .padding(.vertical, 6)
             .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-            // Category filter pills
+            // Category filter pills with live enabled counts
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
-                    categoryChip(title: "Tous", category: nil)
+                    categoryChip(
+                        title: "Tous (\(appState.activeToolsCount))",
+                        category: nil
+                    )
                     ForEach(ToolCategory.allCases) { cat in
-                        categoryChip(title: cat.frenchTitle, category: cat)
+                        categoryChip(
+                            title: "\(cat.frenchTitle) (\(appState.enabledCount(in: cat))/\(appState.totalCount(in: cat)))",
+                            category: cat
+                        )
                     }
                 }
             }
@@ -200,6 +255,7 @@ struct DashboardView: View {
                             policy: appState.policy(for: tool),
                             isAlwaysAllowed: appState.isAlwaysAllowed(tool.name),
                             leaseMinutesRemaining: appState.remainingLeaseMinutes(for: tool.name),
+                            estimatedTokens: appState.toolTokenCost(tool.name),
                             onToggle: { appState.setToolEnabled(tool.name, enabled: $0) },
                             onPolicyChange: { appState.setPolicy($0, for: tool.name) },
                             onRevokePermission: { appState.revokePermission(for: tool.name) }
@@ -208,7 +264,7 @@ struct DashboardView: View {
                 }
                 .padding(.vertical, 2)
             }
-            .frame(height: 276)
+            .frame(height: 260)
         }
     }
 
@@ -218,8 +274,8 @@ struct DashboardView: View {
             selectedCategory = category
         } label: {
             Text(title)
-                .font(.system(size: 11, weight: isSelected ? .semibold : .medium))
-                .padding(.horizontal, 10)
+                .font(.system(size: 10.5, weight: isSelected ? .semibold : .medium))
+                .padding(.horizontal, 9)
                 .padding(.vertical, 4)
                 .background(
                     isSelected ? Color.accentColor.opacity(0.18) : Color.primary.opacity(0.05),

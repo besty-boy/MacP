@@ -2,6 +2,7 @@ import AppKit
 import Darwin
 import Foundation
 import IOKit.ps
+import os
 
 /// Collects native macOS battery, CPU, memory, disk, appearance, and thermal statistics using IOKit and Mach APIs.
 public struct SystemStatsTool: MCPTool {
@@ -10,7 +11,7 @@ public struct SystemStatsTool: MCPTool {
     public let shortSubtitle = "CPU, RAM, Batterie, Disque"
     public let symbolName = "gauge.with.dots.needle.67percent"
     public let category: ToolCategory = .workspace
-    public let description = "Retrieves native macOS battery status, real-time CPU usage, load averages, memory usage, disk space, appearance mode, uptime, and thermal state."
+    public let description = "Returns macOS battery, CPU usage/load, RAM, disk space, appearance, uptime, and thermal state."
     public let sensitivity: ToolSensitivity = .standard
     public let permissionReason = "Lecture seule des statistiques matérielles de ce Mac."
 
@@ -84,22 +85,32 @@ public struct SystemStatsTool: MCPTool {
         return .success(try ToolOutputFormatter.encodeJSON(payload))
     }
 
-    /// Collects a full native macOS telemetry snapshot (also used directly by the live Bento Dashboard!).
+    /// Collects a full native macOS telemetry snapshot (also used directly by the live Bento Dashboard).
     public static func collectSnapshot() async -> SystemStatsPayload {
         let cpuSample = await collectCPUStats()
-        let isDark = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
+        let isDark = isDarkModeEnabled()
+        let info = ProcessInfo.processInfo
         return SystemStatsPayload(
-            hostName: ProcessInfo.processInfo.hostName,
-            macOSVersion: ProcessInfo.processInfo.operatingSystemVersionString,
-            uptimeSeconds: Int(ProcessInfo.processInfo.systemUptime),
-            thermalState: thermalStateDescription(ProcessInfo.processInfo.thermalState),
-            lowPowerModeEnabled: ProcessInfo.processInfo.isLowPowerModeEnabled,
+            hostName: info.hostName,
+            macOSVersion: info.operatingSystemVersionString,
+            uptimeSeconds: Int(info.systemUptime),
+            thermalState: thermalStateDescription(info.thermalState),
+            lowPowerModeEnabled: info.isLowPowerModeEnabled,
             appearance: isDark ? "dark" : "light",
             battery: collectBatteryStats(),
             cpu: cpuSample,
             memory: collectMemoryStats(),
             disk: collectDiskStats()
         )
+    }
+
+    /// Live Dark Mode reader that reflects immediate changes without stale `UserDefaults.standard` caching.
+    public static func isDarkModeEnabled() -> Bool {
+        CFPreferencesAppSynchronize(kCFPreferencesAnyApplication)
+        if let style = CFPreferencesCopyAppValue("AppleInterfaceStyle" as CFString, kCFPreferencesAnyApplication) as? String {
+            return style.caseInsensitiveCompare("Dark") == .orderedSame
+        }
+        return false
     }
 
     // MARK: - Battery (IOKit)
@@ -166,7 +177,7 @@ public struct SystemStatsTool: MCPTool {
         )
     }
 
-    // MARK: - CPU (Mach host_statistics + getloadavg)
+    // MARK: - CPU (Mach host_statistics + cached delta for zero-sleep repeated reads)
 
     private struct CPUTicks: Sendable {
         let user: UInt64
@@ -177,6 +188,14 @@ public struct SystemStatsTool: MCPTool {
         var total: UInt64 { user &+ system &+ idle &+ nice }
         var active: UInt64 { user &+ system &+ nice }
     }
+
+    private struct CachedCPUSample: Sendable {
+        var ticks: CPUTicks
+        var capturedAt: ContinuousClock.Instant
+        var lastUsagePercent: Double?
+    }
+
+    private static let cpuSampleCache = OSAllocatedUnfairLock<CachedCPUSample?>(initialState: nil)
 
     private static func readCPUTicks() -> CPUTicks? {
         let hostPort = mach_host_self()
@@ -203,22 +222,52 @@ public struct SystemStatsTool: MCPTool {
     }
 
     public static func collectCPUStats() async -> CPUStats {
-        let first = readCPUTicks()
-        try? await Task.sleep(for: .milliseconds(150))
-        var second = readCPUTicks()
-
-        if let first, let s = second, s.total == first.total {
-            try? await Task.sleep(for: .milliseconds(100))
-            second = readCPUTicks()
-        }
-
+        let now = ContinuousClock.now
+        let currentTicks = readCPUTicks()
         var usagePercent: Double?
-        if let first, let second {
-            let deltaTotal = second.total >= first.total ? (second.total - first.total) : 0
-            let deltaActive = second.active >= first.active ? (second.active - first.active) : 0
-            if deltaTotal > 0 {
-                let raw = (Double(deltaActive) / Double(deltaTotal)) * 100.0
-                usagePercent = (raw * 10.0).rounded() / 10.0
+
+        if let currentTicks {
+            let cachedResult: (computed: Double?, needsShortSample: Bool) = cpuSampleCache.withLock { cache in
+                if let prev = cache {
+                    let age = prev.capturedAt.duration(to: now)
+                    // Sub-100ms duplicate call: return the recent reading immediately with zero sleep.
+                    if age < .milliseconds(100), let recent = prev.lastUsagePercent {
+                        return (recent, false)
+                    }
+                    // Recent baseline (0.1s ... 15s): compute instantaneous delta with ZERO sleep!
+                    if age <= .seconds(15) {
+                        let deltaTotal = currentTicks.total >= prev.ticks.total ? (currentTicks.total - prev.ticks.total) : 0
+                        let deltaActive = currentTicks.active >= prev.ticks.active ? (currentTicks.active - prev.ticks.active) : 0
+                        if deltaTotal > 0 {
+                            let pct = ((Double(deltaActive) / Double(deltaTotal)) * 1000.0).rounded() / 10.0
+                            cache = CachedCPUSample(ticks: currentTicks, capturedAt: now, lastUsagePercent: pct)
+                            return (pct, false)
+                        }
+                    }
+                }
+                return (nil, true)
+            }
+
+            if let computed = cachedResult.computed {
+                usagePercent = computed
+            } else if cachedResult.needsShortSample {
+                // Cold start (no recent baseline): take a brief 80ms delta sample.
+                try? await Task.sleep(for: .milliseconds(80))
+                if let secondTicks = readCPUTicks() {
+                    let deltaTotal = secondTicks.total >= currentTicks.total ? (secondTicks.total - currentTicks.total) : 0
+                    let deltaActive = secondTicks.active >= currentTicks.active ? (secondTicks.active - currentTicks.active) : 0
+                    if deltaTotal > 0 {
+                        usagePercent = ((Double(deltaActive) / Double(deltaTotal)) * 1000.0).rounded() / 10.0
+                    }
+                    let sampledPercent = usagePercent
+                    cpuSampleCache.withLock {
+                        $0 = CachedCPUSample(
+                            ticks: secondTicks,
+                            capturedAt: .now,
+                            lastUsagePercent: sampledPercent
+                        )
+                    }
+                }
             }
         }
 
@@ -236,7 +285,7 @@ public struct SystemStatsTool: MCPTool {
         )
     }
 
-    // MARK: - Memory (Mach vm_statistics64)
+    // MARK: - Memory (Mach vm_statistics64 matching macOS Activity Monitor)
 
     public static func collectMemoryStats() -> MemoryStats {
         let totalBytes = ProcessInfo.processInfo.physicalMemory
@@ -263,10 +312,14 @@ public struct SystemStatsTool: MCPTool {
             return MemoryStats(totalGB: totalGB, usedGB: 0, freeGB: totalGB, usagePercent: 0)
         }
 
-        let active = UInt64(vmStats.active_count) * pageSize
-        let wired = UInt64(vmStats.wire_count) * pageSize
-        let compressed = UInt64(vmStats.compressor_page_count) * pageSize
-        let usedBytes = min(totalBytes, active + wired + compressed)
+        // Matches macOS Activity Monitor ("Memory Used"): App Memory (internal - purgeable) + Wired + Compressed.
+        let internalPages = UInt64(vmStats.internal_page_count)
+        let purgeablePages = UInt64(vmStats.purgeable_count)
+        let appPages = internalPages >= purgeablePages ? (internalPages - purgeablePages) : 0
+        let wiredPages = UInt64(vmStats.wire_count)
+        let compressedPages = UInt64(vmStats.compressor_page_count)
+
+        let usedBytes = min(totalBytes, (appPages + wiredPages + compressedPages) * pageSize)
         let freeBytes = totalBytes >= usedBytes ? (totalBytes - usedBytes) : 0
 
         let usedGB = (Double(usedBytes) / bytesPerGB * 100).rounded() / 100

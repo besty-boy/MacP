@@ -77,6 +77,37 @@ public enum JSONValue: Sendable, Equatable, Hashable {
             return "{\(pairs.joined(separator: ", "))\(suffix)}"
         }
     }
+
+    /// Detailed, readable formatting for user consent prompts (preserves scripts and multiline arguments).
+    public func detailedPreview(maxLength: Int = 1200) -> String {
+        let rendered: String
+        switch self {
+        case let .object(dict):
+            if dict.isEmpty {
+                return "{}"
+            }
+            let lines = dict.keys.sorted().map { key -> String in
+                guard let value = dict[key] else { return "\(key): null" }
+                switch value {
+                case let .string(text):
+                    if text.contains("\n") {
+                        return "\(key):\n\(text)"
+                    }
+                    return "\(key): \(text)"
+                default:
+                    return "\(key): \(value.compactDescription)"
+                }
+            }
+            rendered = lines.joined(separator: "\n")
+        default:
+            rendered = compactDescription
+        }
+
+        if rendered.count > maxLength {
+            return String(rendered.prefix(max(0, maxLength - 3))) + "..."
+        }
+        return rendered
+    }
 }
 
 extension JSONValue: Codable {

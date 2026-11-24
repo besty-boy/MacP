@@ -1,7 +1,7 @@
 import MacPCore
 import SwiftUI
 
-/// Clients & macOS Integration tab: 1-click setup for Antigravity, Claude Desktop, and Cursor
+/// Clients & macOS Integration tab: 1-click setup for Antigravity, Claude Desktop, Claude Code, Cursor, and Windsurf
 /// plus native Launch at Login (`SMAppService`) and security controls.
 struct ClientsSettingsView: View {
     let appState: AppState
@@ -10,16 +10,17 @@ struct ClientsSettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 if let banner = appState.clientActionBanner {
+                    let bannerColor: Color = banner.isError ? .red : .green
                     HStack(spacing: 8) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                        Text(banner)
+                        Image(systemName: banner.isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                            .foregroundStyle(bannerColor)
+                        Text(banner.text)
                             .font(.system(.caption))
                             .foregroundStyle(.primary)
                     }
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.green.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .background(bannerColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
 
                 // 1-Click MCP Clients Section
@@ -29,12 +30,13 @@ struct ClientsSettingsView: View {
                         .foregroundStyle(.secondary)
                         .padding(.leading, 2)
 
-                    ForEach(SupportedMCPClient.allCases) { client in
+                    ForEach(appState.orderedClients) { client in
                         ClientSetupCard(
                             client: client,
                             status: appState.clientStatuses[client] ?? .notConfigured,
                             onInstall: { appState.configureClient(client) },
-                            onRemove: { appState.removeClientConfig(client) }
+                            onRemove: { appState.removeClientConfig(client) },
+                            onReveal: { appState.revealClientConfig(client) }
                         )
                     }
                 }
@@ -91,7 +93,7 @@ struct ClientsSettingsView: View {
                             Divider()
 
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("Socket Unix local (0600)")
+                                Text("Socket Unix local (0600 • kqueue)")
                                     .font(.system(.caption, weight: .medium))
                                     .foregroundStyle(.secondary)
                                 Text(appState.snapshot.socketPath)
@@ -107,7 +109,7 @@ struct ClientsSettingsView: View {
             }
             .padding(.vertical, 2)
         }
-        .frame(maxHeight: 330)
+        .frame(maxHeight: 334)
     }
 }
 
@@ -116,6 +118,7 @@ private struct ClientSetupCard: View {
     let status: ClientConfigStatus
     let onInstall: () -> Void
     let onRemove: () -> Void
+    let onReveal: () -> Void
 
     private var statusColor: Color {
         switch status {
@@ -160,6 +163,16 @@ private struct ClientSetupCard: View {
                 }
 
                 Spacer(minLength: 6)
+
+                if status != .notConfigured {
+                    Button(action: onReveal) {
+                        Image(systemName: "folder")
+                            .font(.system(size: 10))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Révéler le fichier de configuration dans le Finder")
+                }
 
                 switch status {
                 case .configured:

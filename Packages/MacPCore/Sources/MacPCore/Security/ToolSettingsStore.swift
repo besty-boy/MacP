@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Per-tool user-configurable approval policy.
 public enum ToolPermissionPolicy: String, Sendable, Codable, CaseIterable, Identifiable {
@@ -20,13 +21,60 @@ public enum ToolPermissionPolicy: String, Sendable, Codable, CaseIterable, Ident
     }
 }
 
+/// Curated tool activation presets to balance capabilities and LLM context-window token cost.
+public enum ToolPreset: String, Sendable, CaseIterable, Identifiable {
+    /// Minimal 5-tool footprint (~65% fewer schema tokens sent per LLM turn).
+    case eco
+    /// Daily productivity tools (Calendar, Reminders, Clipboard, Spotlight, Shortcuts, Stats).
+    case productivity
+    /// All 17 native macOS tools enabled.
+    case full
+
+    public var id: String { rawValue }
+
+    public var frenchTitle: String {
+        switch self {
+        case .eco: return "Éco"
+        case .productivity: return "Productivité"
+        case .full: return "Complet"
+        }
+    }
+
+    public var frenchHelp: String {
+        switch self {
+        case .eco: return "5 outils essentiels — empreinte minimale en tokens LLM"
+        case .productivity: return "Outils Productivité Apple + Stats Système (sans Vision/AppleScript)"
+        case .full: return "Active les 17 outils macOS natifs"
+        }
+    }
+
+    public func isToolIncluded(_ toolName: String, category: ToolCategory) -> Bool {
+        switch self {
+        case .eco:
+            return Self.ecoToolNames.contains(toolName)
+        case .productivity:
+            return category == .productivity || toolName == "macos_system_stats"
+        case .full:
+            return true
+        }
+    }
+
+    private static let ecoToolNames: Set<String> = [
+        "macos_system_stats",
+        "macos_list_running_apps",
+        "macos_read_clipboard",
+        "macos_write_clipboard",
+        "macos_spotlight_search"
+    ]
+}
+
 /// Persists per-tool enable/disable flags, approval policies, global Shield Mode,
 /// and "always allow" permission grants in `UserDefaults`.
 public final class ToolSettingsStore: @unchecked Sendable {
     public static let defaultSuiteName = "com.macp.bridge.preferences"
 
     private let defaults: UserDefaults
-    private let lock = NSLock()
+    private let lock = OSAllocatedUnfairLock()
     private let enabledPrefix = "tool.enabled."
     private let alwaysAllowedPrefix = "tool.alwaysAllowed."
     private let policyPrefix = "tool.policy."
@@ -68,6 +116,24 @@ public final class ToolSettingsStore: @unchecked Sendable {
     public func setToolEnabled(_ toolName: String, enabled: Bool) {
         lock.withLock {
             defaults.set(enabled, forKey: enabledPrefix + toolName)
+        }
+    }
+
+    public func setToolsEnabled(_ updates: [String: Bool]) {
+        lock.withLock {
+            for (name, enabled) in updates {
+                defaults.set(enabled, forKey: enabledPrefix + name)
+            }
+        }
+    }
+
+    /// Applies a token-economy preset across all provided tools in one atomic lock pass.
+    public func applyPreset(_ preset: ToolPreset, to tools: [MCPToolMetadata]) {
+        lock.withLock {
+            for tool in tools {
+                let enabled = preset.isToolIncluded(tool.name, category: tool.category)
+                defaults.set(enabled, forKey: enabledPrefix + tool.name)
+            }
         }
     }
 

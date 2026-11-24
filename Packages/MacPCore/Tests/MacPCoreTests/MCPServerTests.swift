@@ -20,16 +20,59 @@ private actor RecordingTransport: NDJSONTransport {
     }
 }
 
+private final class ScriptedTransport: NDJSONTransport, @unchecked Sendable {
+    private let incomingContinuation: AsyncStream<Data>.Continuation
+    private let stream: AsyncStream<Data>
+    private let outgoingContinuation: AsyncStream<Data>.Continuation
+    let outgoing: AsyncStream<Data>
+
+    init() {
+        var inCont: AsyncStream<Data>.Continuation!
+        self.stream = AsyncStream { inCont = $0 }
+        self.incomingContinuation = inCont
+
+        var outCont: AsyncStream<Data>.Continuation!
+        self.outgoing = AsyncStream { outCont = $0 }
+        self.outgoingContinuation = outCont
+    }
+
+    func feed(_ line: Data) {
+        incomingContinuation.yield(line)
+    }
+
+    func finishInput() {
+        incomingContinuation.finish()
+    }
+
+    func incomingLines() -> AsyncStream<Data> {
+        stream
+    }
+
+    func sendLine(_ data: Data) async throws {
+        outgoingContinuation.yield(data)
+    }
+
+    func close() async {
+        incomingContinuation.finish()
+        outgoingContinuation.finish()
+    }
+}
+
 private actor CountingPrompter: PermissionPrompter {
     var requests: [ToolPermissionRequest] = []
     private var decisions: [ToolPermissionDecision]
+    private let delay: Duration
 
-    init(decisions: [ToolPermissionDecision]) {
+    init(decisions: [ToolPermissionDecision], delay: Duration = .zero) {
         self.decisions = decisions
+        self.delay = delay
     }
 
     func requestPermission(for request: ToolPermissionRequest) async -> ToolPermissionDecision {
         requests.append(request)
+        if delay > .zero {
+            try? await Task.sleep(for: delay)
+        }
         if decisions.isEmpty {
             return .deny
         }
@@ -62,6 +105,34 @@ private struct MockEchoTool: MCPTool {
     }
 }
 
+private struct SlowCancellableTool: MCPTool {
+    let name = "mock_slow"
+    let displayName = "Slow"
+    let shortSubtitle = "Sleeps until cancelled"
+    let symbolName = "hourglass"
+    let description = "Slow test tool"
+    let sensitivity: ToolSensitivity = .standard
+    let permissionReason = "Test"
+    let onCancelled: @Sendable () async -> Void
+
+    var inputSchema: JSONValue { ["type": "object", "properties": [:]] }
+
+    func execute(arguments: [String: JSONValue]) async throws -> MCPCallToolResult {
+        do {
+            try await Task.sleep(for: .seconds(5))
+            return .success("done")
+        } catch is CancellationError {
+            await onCancelled()
+            throw CancellationError()
+        }
+    }
+}
+
+private actor CancelFlag {
+    var didCancel = false
+    func mark() { didCancel = true }
+}
+
 @Suite("MCP Server Protocol & Security")
 struct MCPServerTests {
     private func makeIsolatedSettings() -> ToolSettingsStore {
@@ -77,7 +148,7 @@ struct MCPServerTests {
         return AuditLogger(logFileURL: dir.appendingPathComponent("audit.jsonl"))
     }
 
-    @Test("Initialize handshake advertises tools, resources, and prompts capabilities")
+    @Test("Initialize handshake advertises tools, resources, templates, and prompts capabilities")
     func handshakeAndDiscovery() async throws {
         let settings = makeIsolatedSettings()
         let audit = makeTempAuditLogger()
@@ -116,13 +187,18 @@ struct MCPServerTests {
         let pingResp = await session.handleRawMessage(Data(#"{"jsonrpc":"2.0","id":"p1","method":"ping"}"#.utf8))
         #expect(pingResp?.error == nil)
 
-        // 4. tools/list returns both enabled tools with annotations
+        // 4. resources/templates/list returns empty array cleanly
+        let templatesResp = await session.handleRawMessage(Data(#"{"jsonrpc":"2.0","id":"rt1","method":"resources/templates/list"}"#.utf8))
+        #expect(templatesResp?.error == nil)
+        #expect(templatesResp?.result?["resourceTemplates"]?.arrayValue?.isEmpty == true)
+
+        // 5. tools/list returns both enabled tools with annotations
         let listResp = await session.handleRawMessage(Data(#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.utf8))
         let tools = listResp?.result?["tools"]?.arrayValue ?? []
         #expect(tools.count == 2)
         #expect(tools.first?["annotations"]?["readOnlyHint"]?.boolValue == true)
 
-        // 5. Disable one tool -> tools/list filters it out
+        // 6. Disable one tool -> tools/list filters it out
         settings.setToolEnabled("mock_sensitive", enabled: false)
         let listResp2 = await session.handleRawMessage(Data(#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#.utf8))
         let filteredTools = listResp2?.result?["tools"]?.arrayValue ?? []
@@ -193,6 +269,77 @@ struct MCPServerTests {
         #expect(shieldCall?.result?["isError"]?.boolValue == true)
         let shieldText = shieldCall?.result?["content"]?.arrayValue?.first?["text"]?.stringValue ?? ""
         #expect(shieldText.contains("Bouclier"))
+    }
+
+    @Test("PermissionManager serializes concurrent prompts and reuses newly granted 15m lease")
+    func concurrentPromptSerialization() async {
+        let settings = makeIsolatedSettings()
+        let prompter = CountingPrompter(decisions: [.allowFor15Minutes, .deny], delay: .milliseconds(60))
+        let permManager = PermissionManager(settings: settings, prompter: prompter)
+
+        async let first = permManager.authorize(
+            toolName: "mock_sensitive",
+            toolDisplayName: "Sensitive",
+            sensitivity: .sensitive,
+            reason: "Test",
+            clientName: "Cursor",
+            argumentsSummary: "{}"
+        )
+        async let second = permManager.authorize(
+            toolName: "mock_sensitive",
+            toolDisplayName: "Sensitive",
+            sensitivity: .sensitive,
+            reason: "Test",
+            clientName: "Cursor",
+            argumentsSummary: "{}"
+        )
+
+        let (r1, r2) = await (first, second)
+        #expect(r1 == true)
+        #expect(r2 == true)
+        // Must have prompted ONLY ONCE despite concurrent calls!
+        #expect(await prompter.requests.count == 1)
+    }
+
+    @Test("Concurrent session does not head-of-line block ping and honors notifications/cancelled")
+    func concurrentExecutionAndCancellation() async throws {
+        let settings = makeIsolatedSettings()
+        let audit = makeTempAuditLogger()
+        let cancelFlag = CancelFlag()
+        let transport = ScriptedTransport()
+        let registry = MCPToolRegistry(tools: [
+            SlowCancellableTool(onCancelled: { await cancelFlag.mark() })
+        ])
+
+        let session = MCPServerSession(
+            registry: registry,
+            settings: settings,
+            permissionManager: PermissionManager(settings: settings, prompter: StaticPermissionPrompter(decision: .allowOnce)),
+            auditLogger: audit,
+            transport: transport
+        )
+
+        let runTask = Task { await session.run() }
+        var outIter = transport.outgoing.makeAsyncIterator()
+
+        // Launch a 5-second slow tool call
+        transport.feed(Data(#"{"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"mock_slow","arguments":{}}}"#.utf8))
+        // Immediately send ping — must reply immediately without waiting 5 seconds!
+        let pingStart = ContinuousClock.now
+        transport.feed(Data(#"{"jsonrpc":"2.0","id":101,"method":"ping"}"#.utf8))
+
+        let firstOut = try #require(await outIter.next())
+        let pingResp = try JSONRPCCodec.makeDecoder().decode(JSONRPCResponse.self, from: firstOut)
+        #expect(pingResp.id == .int(101))
+        #expect(pingStart.duration(to: .now) < .seconds(1))
+
+        // Now cancel request 100 via MCP notifications/cancelled
+        transport.feed(Data(#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":100,"reason":"user abort"}}"#.utf8))
+        try? await Task.sleep(for: .milliseconds(80))
+        #expect(await cancelFlag.didCancel == true)
+
+        transport.finishInput()
+        await runTask.value
     }
 
     @Test("MCP Resources and Prompts list & fetch cleanly")

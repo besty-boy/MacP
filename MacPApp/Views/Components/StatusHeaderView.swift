@@ -29,7 +29,7 @@ struct StatusHeaderView: View {
             let extra = snapshot.connectedClients.count - 1
             return extra > 0 ? "\(firstClient.displayLabel) +\(extra)" : firstClient.displayLabel
         }
-        return "Pont MCP macOS natif • v2.0"
+        return "Pont MCP macOS natif • \(MacPVersion.short)"
     }
 
     var body: some View {

@@ -1,13 +1,13 @@
 import Foundation
 
-/// Native macOS Spotlight file search powered by `/usr/bin/mdfind`.
+/// Native macOS Spotlight file search powered by `/usr/bin/mdfind` with bounded streaming output.
 public struct SpotlightSearchTool: MCPTool {
     public let name = "macos_spotlight_search"
     public let displayName = "Spotlight"
     public let shortSubtitle = "Recherche de fichiers"
     public let symbolName = "magnifyingglass"
     public let category: ToolCategory = .productivity
-    public let description = "Searches local macOS files using Spotlight metadata index (mdfind) with optional directory, filename-only mode, and result limit."
+    public let description = "Searches local files via macOS Spotlight (mdfind) with optional directory, name-only mode, and limit."
     public let sensitivity: ToolSensitivity = .sensitive
     public let permissionReason = "Un client IA souhaite rechercher des fichiers sur votre Mac via Spotlight."
 
@@ -33,19 +33,19 @@ public struct SpotlightSearchTool: MCPTool {
             "properties": [
                 "query": [
                     "type": "string",
-                    "description": "Search query text (or filename substring when name_only is true)."
+                    "description": "Search text (or filename substring if name_only is true)."
                 ],
                 "directory": [
                     "type": "string",
-                    "description": "Optional directory path to restrict search scope (supports '~')."
+                    "description": "Optional scope directory (supports '~')."
                 ],
                 "name_only": [
                     "type": "boolean",
-                    "description": "When true, matches only file names instead of full-text content (default: false)."
+                    "description": "Match file names only (default: false)."
                 ],
                 "limit": [
                     "type": "integer",
-                    "description": "Maximum number of paths returned (1 to 100, default: 25).",
+                    "description": "Max results (1-100, default: 25).",
                     "minimum": 1,
                     "maximum": 100
                 ]
@@ -66,8 +66,8 @@ public struct SpotlightSearchTool: MCPTool {
     private struct SearchPayload: Codable {
         let query: String
         let directory: String?
-        let totalFound: Int
         let returned: Int
+        let hasMore: Bool
         let matches: [SpotlightMatch]
     }
 
@@ -83,6 +83,9 @@ public struct SpotlightSearchTool: MCPTool {
         var resolvedDir: String?
         if let rawDir = arguments["directory"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
            !rawDir.isEmpty {
+            guard !rawDir.contains("\0") else {
+                return .failure("Chemin de dossier invalide.")
+            }
             let expanded = (rawDir as NSString).expandingTildeInPath
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir), isDir.boolValue else {
@@ -101,10 +104,13 @@ public struct SpotlightSearchTool: MCPTool {
             cliArgs.append(query)
         }
 
+        // Early-terminate `mdfind` once we have `limit + 1` paths so broad queries never buffer tens of megabytes.
         let result = try await NativeProcessRunner.run(
             executablePath: executablePath,
             arguments: cliArgs,
-            timeoutSeconds: 15
+            timeoutSeconds: 15,
+            maxOutputBytes: 512 * 1024,
+            maxStdoutLines: limit + 1
         )
 
         if result.timedOut {
@@ -114,13 +120,13 @@ public struct SpotlightSearchTool: MCPTool {
             return .failure("Erreur Spotlight (code \(result.exitCode)) : \(result.stderr)")
         }
 
-        let allPaths = result.stdout
+        let collectedPaths = result.stdout
             .split(whereSeparator: \.isNewline)
             .map(String.init)
             .filter { !$0.isEmpty }
 
-        let iso = ISO8601DateFormatter()
-        let matches: [SpotlightMatch] = allPaths.prefix(limit).map { path in
+        let hasMore = result.stdoutTruncated || collectedPaths.count > limit
+        let matches: [SpotlightMatch] = collectedPaths.prefix(limit).map { path in
             let url = URL(fileURLWithPath: path)
             let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey])
             return SpotlightMatch(
@@ -128,15 +134,15 @@ public struct SpotlightSearchTool: MCPTool {
                 fileName: url.lastPathComponent,
                 isDirectory: values?.isDirectory ?? false,
                 sizeBytes: values?.fileSize,
-                modifiedAt: values?.contentModificationDate.map { iso.string(from: $0) }
+                modifiedAt: values?.contentModificationDate.map { ISO8601Codec.format($0) }
             )
         }
 
         let payload = SearchPayload(
             query: query,
             directory: resolvedDir,
-            totalFound: allPaths.count,
             returned: matches.count,
+            hasMore: hasMore,
             matches: matches
         )
         return .success(try ToolOutputFormatter.encodeJSON(payload))

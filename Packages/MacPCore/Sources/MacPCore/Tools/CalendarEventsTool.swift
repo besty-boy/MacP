@@ -1,64 +1,6 @@
 import EventKit
 import Foundation
 
-/// Shared EventKit access helper for Calendar tools.
-enum CalendarAccessHelper {
-    enum Result: Sendable {
-        case granted
-        case denied(String)
-    }
-
-    static func ensureFullAccess() async -> Result {
-        let status = EKEventStore.authorizationStatus(for: .event)
-        switch status {
-        case .fullAccess:
-            return .granted
-        case .notDetermined:
-            do {
-                let store = EKEventStore()
-                let granted = try await store.requestFullAccessToEvents()
-                return granted
-                    ? .granted
-                    : .denied("Accès au Calendrier macOS refusé par l'utilisateur.")
-            } catch {
-                return .denied("Erreur lors de la demande d'accès au Calendrier : \(error.localizedDescription)")
-            }
-        case .writeOnly:
-            return .denied("MacP dispose uniquement d'un accès en écriture au Calendrier. Activez l'accès complet dans Réglages Système > Confidentialité et sécurité > Calendriers.")
-        case .denied, .restricted:
-            return .denied("Accès au Calendrier macOS refusé ou restreint. Autorisez MacP dans Réglages Système > Confidentialité et sécurité > Calendriers.")
-        @unknown default:
-            return .denied("Statut d'autorisation EventKit inconnu.")
-        }
-    }
-
-    static func parseISO8601(_ value: String) -> Date? {
-        let withFractional = ISO8601DateFormatter()
-        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = withFractional.date(from: value) {
-            return date
-        }
-
-        let standard = ISO8601DateFormatter()
-        standard.formatOptions = [.withInternetDateTime]
-        if let date = standard.date(from: value) {
-            return date
-        }
-
-        // Also support local date-time without timezone suffix (e.g. "2026-11-20T14:30:00").
-        let localFormatter = DateFormatter()
-        localFormatter.locale = Locale(identifier: "en_US_POSIX")
-        localFormatter.timeZone = .current
-        localFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        if let date = localFormatter.date(from: value) {
-            return date
-        }
-
-        localFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
-        return localFormatter.date(from: value)
-    }
-}
-
 /// Lists macOS Calendar events for today (or a requested date range) using native `EventKit`.
 public struct CalendarEventsTool: MCPTool {
     public let name = "macos_list_calendar_events"
@@ -66,7 +8,7 @@ public struct CalendarEventsTool: MCPTool {
     public let shortSubtitle = "Événements EventKit"
     public let symbolName = "calendar"
     public let category: ToolCategory = .productivity
-    public let description = "Lists macOS Calendar events for today or a specified date range using EventKit."
+    public let description = "Lists macOS Calendar events for today or a date range via EventKit."
     public let sensitivity: ToolSensitivity = .sensitive
     public let permissionReason = "Un client IA souhaite consulter vos événements du Calendrier macOS."
 
@@ -88,11 +30,11 @@ public struct CalendarEventsTool: MCPTool {
             "properties": [
                 "date": [
                     "type": "string",
-                    "description": "Start date in YYYY-MM-DD format (local timezone). Defaults to today."
+                    "description": "Start date YYYY-MM-DD (local timezone). Default: today."
                 ],
                 "days": [
                     "type": "integer",
-                    "description": "Number of days to include starting from 'date' (1 to 31). Defaults to 1 (today).",
+                    "description": "Number of days (1-31, default: 1).",
                     "minimum": 1,
                     "maximum": 31
                 ],
@@ -106,6 +48,7 @@ public struct CalendarEventsTool: MCPTool {
     }
 
     public struct CalendarEventDTO: Sendable, Codable, Equatable {
+        public let eventId: String?
         public let title: String
         public let calendar: String
         public let startDate: String
@@ -119,6 +62,7 @@ public struct CalendarEventsTool: MCPTool {
         let rangeStart: String
         let rangeEnd: String
         let count: Int
+        let availableCalendars: [String]?
         let events: [CalendarEventDTO]
     }
 
@@ -141,27 +85,25 @@ public struct CalendarEventsTool: MCPTool {
             return .failure("Impossible de calculer la plage de dates demandée.")
         }
 
-        switch await CalendarAccessHelper.ensureFullAccess() {
+        switch await SharedEventKitStore.shared.ensureFullAccess(for: .event) {
         case .granted:
             break
         case let .denied(message):
             return .failure(message)
         }
 
-        let events = Self.fetchEvents(
+        let fetched = Self.fetchEvents(
             from: startDate,
             to: endDate,
             calendarFilter: (calendarFilter?.isEmpty == false) ? calendarFilter : nil
         )
 
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime]
-
         let payload = CalendarResponsePayload(
-            rangeStart: iso.string(from: startDate),
-            rangeEnd: iso.string(from: endDate),
-            count: events.count,
-            events: events
+            rangeStart: ISO8601Codec.format(startDate),
+            rangeEnd: ISO8601Codec.format(endDate),
+            count: fetched.events.count,
+            availableCalendars: fetched.availableCalendarsHint,
+            events: fetched.events
         )
 
         return .success(try ToolOutputFormatter.encodeJSON(payload))
@@ -200,15 +142,16 @@ public struct CalendarEventsTool: MCPTool {
         from startDate: Date,
         to endDate: Date,
         calendarFilter: String?
-    ) -> [CalendarEventDTO] {
-        let store = EKEventStore()
+    ) -> (events: [CalendarEventDTO], availableCalendarsHint: [String]?) {
+        let store = SharedEventKitStore.shared.eventStore
         let calendars: [EKCalendar]?
         if let filter = calendarFilter {
-            let matched = store.calendars(for: .event).filter {
+            let allCalendars = store.calendars(for: .event)
+            let matched = allCalendars.filter {
                 $0.title.localizedCaseInsensitiveCompare(filter) == .orderedSame
             }
             if matched.isEmpty {
-                return []
+                return ([], allCalendars.map(\.title).sorted())
             }
             calendars = matched
         } else {
@@ -221,29 +164,29 @@ public struct CalendarEventsTool: MCPTool {
             calendars: calendars
         )
 
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime]
-
-        return store.events(matching: predicate)
+        let events = store.events(matching: predicate)
             .sorted { $0.startDate < $1.startDate }
             .map { event in
                 let trimmedNotes: String?
                 if let notes = event.notes, !notes.isEmpty {
-                    trimmedNotes = notes.count > 500 ? String(notes.prefix(500)) + "..." : notes
+                    trimmedNotes = notes.count > 400 ? String(notes.prefix(397)) + "..." : notes
                 } else {
                     trimmedNotes = nil
                 }
 
                 return CalendarEventDTO(
+                    eventId: event.eventIdentifier,
                     title: event.title ?? "(Sans titre)",
                     calendar: event.calendar.title,
-                    startDate: iso.string(from: event.startDate),
-                    endDate: iso.string(from: event.endDate),
+                    startDate: ISO8601Codec.format(event.startDate),
+                    endDate: ISO8601Codec.format(event.endDate),
                     isAllDay: event.isAllDay,
                     location: (event.location?.isEmpty == false) ? event.location : nil,
                     notes: trimmedNotes
                 )
             }
+
+        return (events, nil)
     }
 }
 
@@ -254,7 +197,7 @@ public struct CreateCalendarEventTool: MCPTool {
     public let shortSubtitle = "Ajouter au Calendrier"
     public let symbolName = "calendar.badge.plus"
     public let category: ToolCategory = .productivity
-    public let description = "Creates a new event in the macOS Calendar app via EventKit."
+    public let description = "Creates a new macOS Calendar event via EventKit."
     public let sensitivity: ToolSensitivity = .sensitive
     public let permissionReason = "Un client IA souhaite créer un nouvel événement dans votre Calendrier macOS."
 
@@ -276,31 +219,31 @@ public struct CreateCalendarEventTool: MCPTool {
             "properties": [
                 "title": [
                     "type": "string",
-                    "description": "Title of the calendar event."
+                    "description": "Event title."
                 ],
                 "start_iso": [
                     "type": "string",
-                    "description": "Start date/time in ISO-8601 format (e.g. '2026-11-21T14:00:00+01:00' or '2026-11-21T14:00')."
+                    "description": "Start ISO-8601 date/time (e.g. '2026-11-21T14:00:00+01:00')."
                 ],
                 "end_iso": [
                     "type": "string",
-                    "description": "End date/time in ISO-8601 format. Defaults to 1 hour after start_iso."
+                    "description": "End ISO-8601 date/time (default: start + 1h)."
                 ],
                 "calendar_name": [
                     "type": "string",
-                    "description": "Optional target calendar title. Defaults to the default macOS calendar."
+                    "description": "Optional target calendar title."
                 ],
                 "location": [
                     "type": "string",
-                    "description": "Optional event location."
+                    "description": "Optional location."
                 ],
                 "notes": [
                     "type": "string",
-                    "description": "Optional notes/description."
+                    "description": "Optional notes."
                 ],
                 "is_all_day": [
                     "type": "boolean",
-                    "description": "Set true for an all-day event (default: false)."
+                    "description": "All-day event (default: false)."
                 ]
             ],
             "required": ["title", "start_iso"],
@@ -325,13 +268,13 @@ public struct CreateCalendarEventTool: MCPTool {
         }
 
         guard let startStr = arguments["start_iso"]?.stringValue,
-              let startDate = CalendarAccessHelper.parseISO8601(startStr) else {
+              let startDate = ISO8601Codec.parse(startStr) else {
             return .failure("Date 'start_iso' invalide. Utilisez un format ISO-8601 (ex: 2026-11-21T14:00:00+01:00).")
         }
 
         let endDate: Date
         if let endStr = arguments["end_iso"]?.stringValue, !endStr.isEmpty {
-            guard let parsedEnd = CalendarAccessHelper.parseISO8601(endStr) else {
+            guard let parsedEnd = ISO8601Codec.parse(endStr) else {
                 return .failure("Date 'end_iso' invalide. Utilisez un format ISO-8601.")
             }
             guard parsedEnd >= startDate else {
@@ -347,14 +290,14 @@ public struct CreateCalendarEventTool: MCPTool {
         let notes = arguments["notes"]?.stringValue
         let isAllDay = arguments["is_all_day"]?.boolValue ?? false
 
-        switch await CalendarAccessHelper.ensureFullAccess() {
+        switch await SharedEventKitStore.shared.ensureFullAccess(for: .event) {
         case .granted:
             break
         case let .denied(message):
             return .failure(message)
         }
 
-        let store = EKEventStore()
+        let store = SharedEventKitStore.shared.eventStore
         let targetCalendar: EKCalendar?
         if let calendarName, !calendarName.isEmpty {
             targetCalendar = store.calendars(for: .event).first {
@@ -382,16 +325,13 @@ public struct CreateCalendarEventTool: MCPTool {
 
         try store.save(event, span: .thisEvent, commit: true)
 
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime]
-
         let payload = CreatedEventPayload(
             created: true,
             eventIdentifier: event.eventIdentifier,
             title: title,
             calendar: resolvedCalendar.title,
-            startDate: iso.string(from: startDate),
-            endDate: iso.string(from: endDate),
+            startDate: ISO8601Codec.format(startDate),
+            endDate: ISO8601Codec.format(endDate),
             isAllDay: isAllDay
         )
         return .success(try ToolOutputFormatter.encodeJSON(payload))

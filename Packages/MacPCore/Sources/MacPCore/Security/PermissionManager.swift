@@ -27,6 +27,7 @@ public struct ToolPermissionRequest: Sendable, Equatable {
     public let reason: String
     public let clientName: String
     public let argumentsSummary: String
+    public let argumentsDetail: String
 
     public init(
         toolName: String,
@@ -35,7 +36,8 @@ public struct ToolPermissionRequest: Sendable, Equatable {
         policy: ToolPermissionPolicy = .askOnce,
         reason: String,
         clientName: String,
-        argumentsSummary: String
+        argumentsSummary: String,
+        argumentsDetail: String? = nil
     ) {
         self.toolName = toolName
         self.toolDisplayName = toolDisplayName
@@ -44,6 +46,7 @@ public struct ToolPermissionRequest: Sendable, Equatable {
         self.reason = reason
         self.clientName = clientName
         self.argumentsSummary = argumentsSummary
+        self.argumentsDetail = argumentsDetail ?? argumentsSummary
     }
 }
 
@@ -73,7 +76,8 @@ public struct StaticPermissionPrompter: PermissionPrompter {
     }
 }
 
-/// Coordinates permission checks, persisted grants, timed 15-minute leases, and serialized user prompts.
+/// Coordinates permission checks, persisted grants, timed 15-minute leases, and strictly serialized user prompts.
+/// Uses an explicit FIFO async lock to prevent Swift actor reentrancy from stacking concurrent `NSAlert` dialogs.
 public actor PermissionManager {
     public static let temporaryGrantDuration: TimeInterval = 15 * 60
 
@@ -81,44 +85,47 @@ public actor PermissionManager {
     private let prompter: any PermissionPrompter
     private var temporaryGrants: [String: Date] = [:]
 
+    // Explicit prompt serialization across `await prompter.requestPermission(...)` suspension points.
+    private var isPrompting = false
+    private var promptWaiters: [CheckedContinuation<Void, Never>] = []
+
     public init(settings: ToolSettingsStore, prompter: any PermissionPrompter) {
         self.settings = settings
         self.prompter = prompter
     }
 
     /// Ensures the caller is allowed to execute the tool.
-    /// Actor isolation guarantees only one native `NSAlert` prompt is presented at a time.
+    /// Strictly serializes interactive consent prompts and re-evaluates newly granted leases/always-allow flags.
     public func authorize(
         toolName: String,
         toolDisplayName: String,
         sensitivity: ToolSensitivity,
         reason: String,
         clientName: String,
-        argumentsSummary: String
+        argumentsSummary: String,
+        argumentsDetail: String? = nil
     ) async -> Bool {
+        if let immediate = checkCachedGrant(toolName: toolName, sensitivity: sensitivity) {
+            return immediate
+        }
+
+        await acquirePromptTurn()
+        defer { releasePromptTurn() }
+
+        // If the MCP request was cancelled while waiting for a prior prompt, deny without showing a stale dialog.
+        if Task.isCancelled {
+            return false
+        }
+
+        // Re-check after acquiring the prompt turn: an earlier queued call may have granted 15m or Always Allow.
+        if let cached = checkCachedGrant(toolName: toolName, sensitivity: sensitivity) {
+            return cached
+        }
+
         let policy = settings.permissionPolicy(
             for: toolName,
             defaultPolicy: sensitivity.defaultPolicy
         )
-
-        switch policy {
-        case .automatic:
-            return true
-
-        case .askOnce:
-            if settings.isAlwaysAllowed(toolName) {
-                return true
-            }
-            if let expiry = temporaryGrants[toolName], expiry > Date() {
-                return true
-            } else {
-                temporaryGrants.removeValue(forKey: toolName)
-            }
-
-        case .alwaysAsk:
-            // Strict mode: never bypass prompt with cached permanent or timed grants.
-            break
-        }
 
         let request = ToolPermissionRequest(
             toolName: toolName,
@@ -127,7 +134,8 @@ public actor PermissionManager {
             policy: policy,
             reason: reason,
             clientName: clientName,
-            argumentsSummary: argumentsSummary
+            argumentsSummary: argumentsSummary,
+            argumentsDetail: argumentsDetail ?? argumentsSummary
         )
 
         let decision = await prompter.requestPermission(for: request)
@@ -167,5 +175,50 @@ public actor PermissionManager {
     public func revokeAllGrants(for toolNames: [String]) {
         settings.revokeAllPermissions(for: toolNames)
         temporaryGrants.removeAll()
+    }
+
+    // MARK: - Helpers
+
+    private func checkCachedGrant(toolName: String, sensitivity: ToolSensitivity) -> Bool? {
+        let policy = settings.permissionPolicy(
+            for: toolName,
+            defaultPolicy: sensitivity.defaultPolicy
+        )
+
+        switch policy {
+        case .automatic:
+            return true
+        case .askOnce:
+            if settings.isAlwaysAllowed(toolName) {
+                return true
+            }
+            if let expiry = temporaryGrants[toolName], expiry > Date() {
+                return true
+            } else {
+                temporaryGrants.removeValue(forKey: toolName)
+                return nil
+            }
+        case .alwaysAsk:
+            return nil
+        }
+    }
+
+    private func acquirePromptTurn() async {
+        if !isPrompting {
+            isPrompting = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            promptWaiters.append(continuation)
+        }
+    }
+
+    private func releasePromptTurn() {
+        if !promptWaiters.isEmpty {
+            let next = promptWaiters.removeFirst()
+            next.resume()
+        } else {
+            isPrompting = false
+        }
     }
 }

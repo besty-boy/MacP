@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import os
 
 /// Resolves the local-user Unix domain socket path used between `MacP.app` and `MacP --stdio`.
 public enum MacPSocketPath {
@@ -45,20 +46,48 @@ public enum MacPSocketPath {
         let length = socklen_t(MemoryLayout<sockaddr_un>.size)
         return (addr, length)
     }
+
+    fileprivate static func configureSocketFD(_ fd: Int32, nonBlocking: Bool) {
+        // Prevent child processes (`shortcuts`, `osascript`, `mdfind`, `screencapture`) from inheriting IPC sockets.
+        let fdFlags = Darwin.fcntl(fd, F_GETFD)
+        if fdFlags >= 0 {
+            _ = Darwin.fcntl(fd, F_SETFD, fdFlags | FD_CLOEXEC)
+        }
+
+        if nonBlocking {
+            let statusFlags = Darwin.fcntl(fd, F_GETFL)
+            if statusFlags >= 0 {
+                _ = Darwin.fcntl(fd, F_SETFL, statusFlags | O_NONBLOCK)
+            }
+        }
+
+        var noSigPipe: Int32 = 1
+        _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+    }
 }
 
-/// Local Unix Domain Socket server embedded inside `MacP.app` (Menu Bar daemon).
-/// Secures the socket to `0600` (current macOS user only).
+/// Event-driven local Unix Domain Socket server embedded inside `MacP.app` (Menu Bar daemon).
+/// - Zero idle CPU wakeups (`DispatchSourceRead` / kqueue instead of polling loops).
+/// - Restricted to current macOS user (`0700` dir, `0600` socket, plus `getpeereid` UID check).
+/// - Atomic `flock` instance guard preventing stale-socket races without phantom client probes.
 public final class UnixSocketServer: @unchecked Sendable {
     public let socketPath: String
-    private let stateLock = NSLock()
+    private let lockFilePath: String
+
+    private struct ServerState: @unchecked Sendable {
+        var isRunning = false
+        var listenFD: Int32 = -1
+        var lockFD: Int32 = -1
+        var acceptSource: DispatchSourceRead?
+        var activeConnections: [UUID: FileDescriptorTransport] = [:]
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: ServerState())
     private let acceptQueue = DispatchQueue(label: "com.macp.unix-socket.accept", qos: .userInitiated)
-    private var listenFD: Int32 = -1
-    private var isRunning = false
-    private var activeConnections: [UUID: FileDescriptorTransport] = [:]
 
     public init(socketPath: String = MacPSocketPath.defaultPath) {
         self.socketPath = socketPath
+        self.lockFilePath = socketPath + ".lock"
         _ = signal(SIGPIPE, SIG_IGN)
     }
 
@@ -70,12 +99,9 @@ public final class UnixSocketServer: @unchecked Sendable {
     public func start(
         onClientConnected: @escaping @Sendable (UUID, FileDescriptorTransport) async -> Void
     ) throws {
-        stateLock.lock()
-        if isRunning {
-            stateLock.unlock()
+        if state.withLock({ $0.isRunning }) {
             return
         }
-        stateLock.unlock()
 
         let parentDir = URL(fileURLWithPath: socketPath).deletingLastPathComponent()
         try FileManager.default.createDirectory(
@@ -84,20 +110,31 @@ public final class UnixSocketServer: @unchecked Sendable {
             attributes: [.posixPermissions: 0o700]
         )
 
-        // Remove stale socket file if it exists and is not actively served.
+        // Acquire an atomic exclusive non-blocking advisory lock (`O_EXLOCK | O_NONBLOCK`) so a second MacP
+        // instance fails cleanly without opening a phantom probe connection to the live server.
+        let lockFD = Darwin.open(lockFilePath, O_CREAT | O_RDWR | O_CLOEXEC | O_EXLOCK | O_NONBLOCK, 0o600)
+        if lockFD < 0 && (errno == EWOULDBLOCK || errno == EAGAIN) {
+            throw TransportError.bindFailed(EADDRINUSE, socketPath)
+        }
+
+        // Remove stale socket file if it exists and is not actively served (e.g. legacy instance).
         if FileManager.default.fileExists(atPath: socketPath) {
             if !Self.canConnect(path: socketPath) {
                 _ = Darwin.unlink(socketPath)
             } else {
-                // Another MacP instance is actively listening on this socket.
+                if lockFD >= 0 { _ = Darwin.close(lockFD) }
                 throw TransportError.bindFailed(EADDRINUSE, socketPath)
             }
         }
 
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
-            throw TransportError.socketCreationFailed(errno)
+            let err = errno
+            if lockFD >= 0 { _ = Darwin.close(lockFD) }
+            throw TransportError.socketCreationFailed(err)
         }
+
+        MacPSocketPath.configureSocketFD(fd, nonBlocking: true)
 
         var (addr, addrLen) = try MacPSocketPath.makeAddress(path: socketPath)
         let bindResult = withUnsafePointer(to: &addr) { ptr in
@@ -109,101 +146,120 @@ public final class UnixSocketServer: @unchecked Sendable {
         guard bindResult == 0 else {
             let err = errno
             _ = Darwin.close(fd)
+            if lockFD >= 0 { _ = Darwin.close(lockFD) }
             throw TransportError.bindFailed(err, socketPath)
         }
 
         // Restrict socket permissions strictly to the current local user (rw-------).
         _ = Darwin.chmod(socketPath, 0o600)
 
-        guard Darwin.listen(fd, 16) == 0 else {
+        guard Darwin.listen(fd, 32) == 0 else {
             let err = errno
             _ = Darwin.close(fd)
             _ = Darwin.unlink(socketPath)
+            if lockFD >= 0 { _ = Darwin.close(lockFD) }
             throw TransportError.listenFailed(err)
         }
 
-        stateLock.lock()
-        self.listenFD = fd
-        self.isRunning = true
-        stateLock.unlock()
-
-        DiagnosticLog.write("UnixSocketServer listening on \(socketPath)")
-
-        acceptQueue.async { [weak self] in
-            self?.acceptLoop(listenFD: fd, onClientConnected: onClientConnected)
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: acceptQueue)
+        source.setEventHandler { [weak self] in
+            self?.acceptPendingClients(listenFD: fd, onClientConnected: onClientConnected)
         }
+        source.setCancelHandler {
+            _ = Darwin.shutdown(fd, SHUT_RDWR)
+            _ = Darwin.close(fd)
+        }
+
+        state.withLock { s in
+            s.listenFD = fd
+            s.lockFD = lockFD
+            s.acceptSource = source
+            s.isRunning = true
+        }
+
+        source.resume()
+        DiagnosticLog.write("UnixSocketServer listening on \(socketPath) (event-driven kqueue)")
     }
 
     public func stop() {
         stopSync()
     }
 
-    private func stopSync() {
-        stateLock.lock()
-        guard isRunning else {
-            stateLock.unlock()
-            return
+    public func stopSync() {
+        let teardown: (
+            wasRunning: Bool,
+            source: DispatchSourceRead?,
+            lockFD: Int32,
+            connections: [FileDescriptorTransport]
+        ) = state.withLock { s in
+            guard s.isRunning else {
+                return (false, nil, -1, [])
+            }
+            s.isRunning = false
+            s.listenFD = -1
+            let src = s.acceptSource
+            s.acceptSource = nil
+            let lock = s.lockFD
+            s.lockFD = -1
+            let conns = Array(s.activeConnections.values)
+            s.activeConnections.removeAll()
+            return (true, src, lock, conns)
         }
-        isRunning = false
-        let fd = listenFD
-        listenFD = -1
-        let connections = Array(activeConnections.values)
-        activeConnections.removeAll()
-        stateLock.unlock()
 
-        if fd >= 0 {
-            _ = Darwin.shutdown(fd, SHUT_RDWR)
-            _ = Darwin.close(fd)
-        }
+        guard teardown.wasRunning else { return }
 
-        for connection in connections {
+        teardown.source?.cancel()
+
+        for connection in teardown.connections {
             connection.closeSync()
         }
 
         _ = Darwin.unlink(socketPath)
+        if teardown.lockFD >= 0 {
+            _ = Darwin.close(teardown.lockFD)
+            _ = Darwin.unlink(lockFilePath)
+        }
         DiagnosticLog.write("UnixSocketServer stopped (\(socketPath))")
     }
 
-    private func acceptLoop(
+    private func acceptPendingClients(
         listenFD: Int32,
         onClientConnected: @escaping @Sendable (UUID, FileDescriptorTransport) async -> Void
     ) {
-        while checkRunning() {
-            var pfd = pollfd(fd: listenFD, events: Int16(POLLIN), revents: 0)
-            let ready = Darwin.poll(&pfd, 1, 150)
+        let expectedUID = Darwin.geteuid()
 
-            if ready < 0 {
-                if errno == EINTR { continue }
-                break
-            }
-            if ready == 0 {
-                continue
-            }
-            if (pfd.revents & Int16(POLLHUP | POLLERR | POLLNVAL)) != 0 {
-                break
-            }
-
+        while state.withLock({ $0.isRunning }) {
             let clientFD = Darwin.accept(listenFD, nil, nil)
             if clientFD < 0 {
-                if errno == EINTR { continue }
-                if !checkRunning() { break }
+                let err = errno
+                if err == EINTR { continue }
+                if err == EAGAIN || err == EWOULDBLOCK { break }
+                break
+            }
+
+            // Defense in depth: verify the connecting local process belongs to the exact same macOS user.
+            var peerUID: uid_t = 0
+            var peerGID: gid_t = 0
+            guard Darwin.getpeereid(clientFD, &peerUID, &peerGID) == 0, peerUID == expectedUID else {
+                _ = Darwin.close(clientFD)
+                DiagnosticLog.write("Rejected Unix socket peer with unexpected UID")
                 continue
             }
 
-            var noSigPipe: Int32 = 1
-            _ = Darwin.setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+            MacPSocketPath.configureSocketFD(clientFD, nonBlocking: true)
 
             let clientID = UUID()
             let transport = FileDescriptorTransport(
                 readFD: clientFD,
                 writeFD: clientFD,
                 closeOnDeinit: true,
+                isNonBlocking: true,
                 label: "com.macp.unix-socket.client.\(clientID.uuidString.prefix(8))"
             )
 
-            stateLock.lock()
-            activeConnections[clientID] = transport
-            stateLock.unlock()
+            state.withLock { s in
+                s.activeConnections[clientID] = transport
+            }
 
             Task { [weak self] in
                 await onClientConnected(clientID, transport)
@@ -214,15 +270,9 @@ public final class UnixSocketServer: @unchecked Sendable {
     }
 
     private func removeConnection(id: UUID) {
-        stateLock.lock()
-        activeConnections.removeValue(forKey: id)
-        stateLock.unlock()
-    }
-
-    private func checkRunning() -> Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return isRunning
+        state.withLock { s in
+            _ = s.activeConnections.removeValue(forKey: id)
+        }
     }
 
     /// Attempts a quick connect probe to check whether a server is actively listening on `path`.
@@ -245,6 +295,9 @@ public enum UnixSocketClient {
             throw TransportError.socketCreationFailed(errno)
         }
 
+        // Keep connect synchronous, then switch the connected FD to non-blocking + CLOEXEC.
+        MacPSocketPath.configureSocketFD(fd, nonBlocking: false)
+
         var (addr, addrLen) = try MacPSocketPath.makeAddress(path: path)
         let result = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
@@ -258,18 +311,19 @@ public enum UnixSocketClient {
             throw TransportError.connectFailed(err, path)
         }
 
-        var noSigPipe: Int32 = 1
-        _ = Darwin.setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        MacPSocketPath.configureSocketFD(fd, nonBlocking: true)
 
         return FileDescriptorTransport(
             readFD: fd,
             writeFD: fd,
             closeOnDeinit: true,
+            isNonBlocking: true,
             label: "com.macp.unix-socket.relay"
         )
     }
 
     /// Relays NDJSON JSON-RPC lines bidirectionally between a local stdio transport and the MacP app socket.
+    /// Exits promptly as soon as either side reaches EOF or disconnects.
     public static func relay(
         stdio: any NDJSONTransport,
         socket: any NDJSONTransport
@@ -298,6 +352,8 @@ public enum UnixSocketClient {
             }
 
             await group.next()
+            await socket.close()
+            await stdio.close()
             group.cancelAll()
         }
     }

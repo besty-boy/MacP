@@ -237,6 +237,43 @@ public struct MCPResourcesListResult: Sendable, Equatable, Codable {
     }
 }
 
+public struct MCPResourceTemplateDefinition: Sendable, Equatable, Codable {
+    public let uriTemplate: String
+    public let name: String
+    public let description: String?
+    public let mimeType: String?
+
+    public init(
+        uriTemplate: String,
+        name: String,
+        description: String? = nil,
+        mimeType: String? = nil
+    ) {
+        self.uriTemplate = uriTemplate
+        self.name = name
+        self.description = description
+        self.mimeType = mimeType
+    }
+}
+
+public struct MCPResourceTemplatesListResult: Sendable, Equatable, Codable {
+    public let resourceTemplates: [MCPResourceTemplateDefinition]
+
+    public init(resourceTemplates: [MCPResourceTemplateDefinition] = []) {
+        self.resourceTemplates = resourceTemplates
+    }
+}
+
+public struct MCPCancelledNotificationParams: Sendable, Equatable, Codable {
+    public let requestId: JSONRPCID
+    public let reason: String?
+
+    public init(requestId: JSONRPCID, reason: String? = nil) {
+        self.requestId = requestId
+        self.reason = reason
+    }
+}
+
 public struct MCPReadResourceParams: Sendable, Equatable, Codable {
     public let uri: String
 

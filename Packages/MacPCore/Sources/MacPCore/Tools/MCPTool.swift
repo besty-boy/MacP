@@ -113,10 +113,28 @@ extension MCPTool {
 public struct MCPToolRegistry: Sendable {
     private let orderedTools: [any MCPTool]
     private let toolsByName: [String: any MCPTool]
+    private let cachedDefinitions: [String: MCPToolDefinition]
+    private let cachedTokenCostByName: [String: Int]
 
     public init(tools: [any MCPTool]) {
         self.orderedTools = tools
         self.toolsByName = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
+
+        let encoder = JSONRPCCodec.makeEncoder()
+        var defs: [String: MCPToolDefinition] = [:]
+        var costs: [String: Int] = [:]
+        defs.reserveCapacity(tools.count)
+        costs.reserveCapacity(tools.count)
+
+        for tool in tools {
+            let def = tool.definition
+            defs[tool.name] = def
+            let bytes = (try? encoder.encode(def).count) ?? 0
+            costs[tool.name] = TokenEstimator.estimate(utf8Bytes: bytes)
+        }
+
+        self.cachedDefinitions = defs
+        self.cachedTokenCostByName = costs
     }
 
     public static func defaultMacOSTools() -> MCPToolRegistry {
@@ -161,132 +179,35 @@ public struct MCPToolRegistry: Sendable {
         guard !settings.isShieldModeActive else {
             return []
         }
-        return orderedTools
-            .filter { settings.isToolEnabled($0.name) }
-            .map(\.definition)
+        return orderedTools.compactMap { tool in
+            guard settings.isToolEnabled(tool.name) else { return nil }
+            return cachedDefinitions[tool.name]
+        }
+    }
+
+    /// Estimates the LLM context token cost of the currently advertised `tools/list` schema.
+    public func estimatedSchemaTokens(enabledUsing settings: ToolSettingsStore) -> Int {
+        guard !settings.isShieldModeActive else { return 0 }
+        var total = 0
+        for tool in orderedTools where settings.isToolEnabled(tool.name) {
+            total += cachedTokenCostByName[tool.name] ?? 0
+        }
+        return total
+    }
+
+    /// Estimates the schema token cost of a single tool.
+    public func estimatedSchemaTokens(forToolNamed name: String) -> Int {
+        cachedTokenCostByName[name] ?? 0
     }
 }
 
-/// Helper for encoding structured tool output payloads as pretty-printed JSON.
+/// Encodes structured tool outputs as compact JSON (no wasted indentation/newlines) to save 25–40% LLM tokens.
 enum ToolOutputFormatter {
     static func encodeJSON<T: Encodable>(_ value: T) throws -> String {
         let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(value)
         return String(decoding: data, as: UTF8.self)
-    }
-}
-
-/// Shared safe subprocess runner used by native macOS CLI bridges (`/usr/bin/shortcuts`, `mdfind`, `osascript`, `screencapture`).
-enum NativeProcessRunner {
-    struct Result: Sendable {
-        let exitCode: Int32
-        let stdout: String
-        let stderr: String
-        let timedOut: Bool
-    }
-
-    private final class OutputCollector: @unchecked Sendable {
-        private let lock = NSLock()
-        private var stdoutData = Data()
-        private var stderrData = Data()
-        private var didTimeOut = false
-
-        func setStdout(_ data: Data) { lock.withLock { stdoutData = data } }
-        func setStderr(_ data: Data) { lock.withLock { stderrData = data } }
-        func markTimedOut() { lock.withLock { didTimeOut = true } }
-
-        func snapshot() -> (stdout: String, stderr: String, timedOut: Bool) {
-            lock.withLock {
-                (
-                    String(decoding: stdoutData, as: UTF8.self),
-                    String(decoding: stderrData, as: UTF8.self),
-                    didTimeOut
-                )
-            }
-        }
-    }
-
-    static func run(
-        executablePath: String,
-        arguments: [String],
-        inputText: String? = nil,
-        timeoutSeconds: TimeInterval = 30
-    ) async throws -> Result {
-        try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: executablePath)
-                process.arguments = arguments
-
-                let stdoutPipe = Pipe()
-                let stderrPipe = Pipe()
-                process.standardOutput = stdoutPipe
-                process.standardError = stderrPipe
-
-                var stdinPipe: Pipe?
-                if inputText != nil {
-                    let pipe = Pipe()
-                    process.standardInput = pipe
-                    stdinPipe = pipe
-                } else {
-                    process.standardInput = FileHandle.nullDevice
-                }
-
-                let outputQueue = DispatchQueue(label: "com.macp.process.pipes", attributes: .concurrent)
-                let readGroup = DispatchGroup()
-                let collector = OutputCollector()
-
-                do {
-                    try process.run()
-                } catch {
-                    continuation.resume(throwing: error)
-                    return
-                }
-
-                if let inputText, let stdinPipe {
-                    if let data = inputText.data(using: .utf8) {
-                        try? stdinPipe.fileHandleForWriting.write(contentsOf: data)
-                    }
-                    try? stdinPipe.fileHandleForWriting.close()
-                }
-
-                readGroup.enter()
-                outputQueue.async {
-                    collector.setStdout(stdoutPipe.fileHandleForReading.readDataToEndOfFile())
-                    readGroup.leave()
-                }
-
-                readGroup.enter()
-                outputQueue.async {
-                    collector.setStderr(stderrPipe.fileHandleForReading.readDataToEndOfFile())
-                    readGroup.leave()
-                }
-
-                let timeoutWork = DispatchWorkItem {
-                    if process.isRunning {
-                        collector.markTimedOut()
-                        process.terminate()
-                    }
-                }
-                DispatchQueue.global(qos: .utility).asyncAfter(
-                    deadline: .now() + timeoutSeconds,
-                    execute: timeoutWork
-                )
-
-                process.waitUntilExit()
-                timeoutWork.cancel()
-                readGroup.wait()
-
-                let result = collector.snapshot()
-                continuation.resume(returning: Result(
-                    exitCode: process.terminationStatus,
-                    stdout: result.stdout,
-                    stderr: result.stderr,
-                    timedOut: result.timedOut
-                ))
-            }
-        }
     }
 }

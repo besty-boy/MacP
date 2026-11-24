@@ -8,7 +8,7 @@ public struct AppleScriptTool: MCPTool {
     public let shortSubtitle = "Automatisation avancée"
     public let symbolName = "applescript"
     public let category: ToolCategory = .automation
-    public let description = "Executes a native macOS AppleScript or JavaScript for Automation (JXA) script via /usr/bin/osascript to automate apps like Finder, Safari, Notes, Mail, or Music. Always requires explicit user approval by default."
+    public let description = "Runs an AppleScript or JXA script via osascript to automate macOS apps. Always prompts by default."
     public let sensitivity: ToolSensitivity = .critical
     public let permissionReason = "Un client IA souhaite exécuter un script AppleScript/JXA sur votre Mac. Vérifiez soigneusement le script avant d'autoriser."
 
@@ -34,16 +34,16 @@ public struct AppleScriptTool: MCPTool {
             "properties": [
                 "script": [
                     "type": "string",
-                    "description": "AppleScript or JXA source code to execute."
+                    "description": "AppleScript or JXA source code."
                 ],
                 "language": [
                     "type": "string",
-                    "description": "Script language: 'AppleScript' (default) or 'JavaScript' (JXA).",
+                    "description": "'AppleScript' (default) or 'JavaScript' (JXA).",
                     "enum": ["AppleScript", "JavaScript"]
                 ],
                 "timeout_seconds": [
                     "type": "integer",
-                    "description": "Execution timeout in seconds (1 to 60, default: 20).",
+                    "description": "Timeout in seconds (1-60, default: 20).",
                     "minimum": 1,
                     "maximum": 60
                 ]

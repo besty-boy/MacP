@@ -1,8 +1,9 @@
 import AppKit
 import SwiftUI
 
+@MainActor
 final class MacPAppDelegate: NSObject, NSApplicationDelegate {
-    var onTerminate: (() -> Void)?
+    weak static var activeAppState: AppState?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Keep MacP strictly as a Menu Bar utility (no Dock icon).
@@ -10,7 +11,8 @@ final class MacPAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        onTerminate?()
+        // Synchronously close and unlink the Unix socket even if the popover was never opened.
+        Self.activeAppState?.stopSync()
     }
 }
 
@@ -21,6 +23,7 @@ struct MacPMenuBarApp: App {
 
     init() {
         let state = AppState()
+        MacPAppDelegate.activeAppState = state
         state.start()
         _appState = State(initialValue: state)
     }
@@ -38,17 +41,12 @@ struct MacPMenuBarApp: App {
         MenuBarExtra {
             DashboardView(appState: appState)
                 .onAppear {
-                    appState.startLiveTelemetry()
+                    appState.setPopoverVisible(true)
                     appState.refreshClientStatuses()
                     appState.refreshLaunchAtLogin()
-                    appDelegate.onTerminate = { [weak appState] in
-                        Task { @MainActor in
-                            appState?.stop()
-                        }
-                    }
                 }
                 .onDisappear {
-                    appState.stopLiveTelemetry()
+                    appState.setPopoverVisible(false)
                 }
         } label: {
             Label {
@@ -64,7 +62,7 @@ struct MacPMenuBarApp: App {
             AuditLogSheetView(appState: appState)
                 .frame(minWidth: 740, minHeight: 500)
         }
-        .defaultSize(width: 840, height: 560)
+        .defaultSize(width: 860, height: 560)
         .windowResizability(.contentMinSize)
     }
 }

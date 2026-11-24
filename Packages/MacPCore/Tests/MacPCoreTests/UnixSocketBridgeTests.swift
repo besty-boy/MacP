@@ -16,6 +16,7 @@ struct UnixSocketBridgeTests {
             .appendingPathComponent("macp-sock-audit-\(UUID().uuidString)", isDirectory: true)
         defer {
             try? FileManager.default.removeItem(atPath: socketPath)
+            try? FileManager.default.removeItem(atPath: socketPath + ".lock")
             try? FileManager.default.removeItem(at: auditDir)
         }
 
@@ -34,6 +35,12 @@ struct UnixSocketBridgeTests {
         let startSnap = await service.currentSnapshot()
         #expect(startSnap.isListening == true)
         #expect(startSnap.isClientConnected == false)
+
+        // Second UnixSocketServer on the same path must fail atomically via O_EXLOCK without flashing a client!
+        let duplicateServer = UnixSocketServer(socketPath: socketPath)
+        #expect(throws: TransportError.self) {
+            try duplicateServer.start { _, _ in }
+        }
 
         // Connect a simulated `--stdio` client to the Unix socket
         let client = try UnixSocketClient.connect(path: socketPath)
@@ -79,11 +86,97 @@ struct UnixSocketBridgeTests {
 
         // 5. Disconnect and verify cleanup
         await client.close()
-        try? await Task.sleep(for: .milliseconds(150))
+        try? await Task.sleep(for: .milliseconds(100))
 
         let disconnectedSnap = await service.currentSnapshot()
         #expect(disconnectedSnap.isClientConnected == false)
 
         await service.stop()
+        #expect(!FileManager.default.fileExists(atPath: socketPath))
+        #expect(!FileManager.default.fileExists(atPath: socketPath + ".lock"))
+    }
+
+    @Test("UnixSocketClient.relay exits immediately when server closes socket even with idle stdio pipe")
+    func relayExitsPromptlyOnServerDisconnect() async throws {
+        let socketPath = "/tmp/macp-relay-\(UUID().uuidString.prefix(8)).sock"
+        defer {
+            try? FileManager.default.removeItem(atPath: socketPath)
+            try? FileManager.default.removeItem(atPath: socketPath + ".lock")
+        }
+
+        let server = UnixSocketServer(socketPath: socketPath)
+        try server.start { _, transport in
+            try? await Task.sleep(for: .milliseconds(60))
+            await transport.close()
+        }
+
+        // Open an idle POSIX pipe simulating stdin (write end stays open!) and stdout.
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        defer {
+            try? stdinPipe.fileHandleForReading.close()
+            try? stdinPipe.fileHandleForWriting.close()
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stdoutPipe.fileHandleForWriting.close()
+        }
+
+        let stdio = StdioTransport(
+            inputHandle: stdinPipe.fileHandleForReading,
+            outputHandle: stdoutPipe.fileHandleForWriting,
+            closeOnDeinit: false
+        )
+        let socket = try UnixSocketClient.connect(path: socketPath)
+
+        let t0 = ContinuousClock.now
+        await UnixSocketClient.relay(stdio: stdio, socket: socket)
+        let elapsed = t0.duration(to: .now)
+
+        // Relay must NOT hang waiting on the open stdin pipe once the socket closes!
+        #expect(elapsed < .seconds(1))
+        server.stopSync()
+    }
+
+    @Test("StdioTransport supports half-closed pipes (stdin EOF before stdout response completes)")
+    func stdioHalfClosedPipeDeliversResponse() async throws {
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        defer {
+            try? stdinPipe.fileHandleForReading.close()
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stdoutPipe.fileHandleForWriting.close()
+        }
+
+        // Write a request and IMMEDIATELY close stdin write end (simulating `printf '...' | MacP --stdio --standalone`).
+        let requestLine = Data(#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#.utf8) + Data([0x0A])
+        try stdinPipe.fileHandleForWriting.write(contentsOf: requestLine)
+        try stdinPipe.fileHandleForWriting.close()
+
+        let suite = "com.macp.halfclose.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        let settings = ToolSettingsStore(userDefaults: defaults)
+        let auditDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("macp-halfclose-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: auditDir) }
+
+        let transport = StdioTransport(
+            inputHandle: stdinPipe.fileHandleForReading,
+            outputHandle: stdoutPipe.fileHandleForWriting,
+            closeOnDeinit: false
+        )
+
+        await MacPBridgeService.runStandaloneStdio(
+            registry: .defaultMacOSTools(),
+            settings: settings,
+            prompter: StaticPermissionPrompter(decision: .deny),
+            auditLogger: AuditLogger(logFileURL: auditDir.appendingPathComponent("audit.jsonl")),
+            transport: transport
+        )
+
+        try stdoutPipe.fileHandleForWriting.close()
+        let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let response = try JSONRPCCodec.makeDecoder().decode(JSONRPCResponse.self, from: outData)
+        #expect(response.id == .int(7))
+        #expect(response.result?["tools"]?.arrayValue?.count == 17)
     }
 }

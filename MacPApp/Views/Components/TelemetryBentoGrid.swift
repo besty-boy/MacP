@@ -1,7 +1,7 @@
 import MacPCore
 import SwiftUI
 
-/// Live 2x2 Bento Grid showing real-time CPU, RAM, Battery/Disk telemetry and MCP Bridge summary.
+/// Live 2x2 Bento Grid showing real-time CPU, RAM, Battery/Disk telemetry and MCP Bridge + LLM token footprint.
 struct TelemetryBentoGrid: View {
     let stats: SystemStatsTool.SystemStatsPayload?
     let snapshot: BridgeSnapshot
@@ -9,6 +9,7 @@ struct TelemetryBentoGrid: View {
     let totalToolsCount: Int
     let resourcesCount: Int
     let promptsCount: Int
+    let estimatedContextTokens: Int
 
     private let columns = [
         GridItem(.flexible(), spacing: 10),
@@ -130,7 +131,7 @@ struct TelemetryBentoGrid: View {
                 }
             }
 
-            // Card 4: MCP Capabilities Summary
+            // Card 4: MCP Capabilities & LLM Context Economy Summary
             BentoCard(cornerRadius: 16, padding: 12) {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
@@ -148,9 +149,12 @@ struct TelemetryBentoGrid: View {
                         .font(.system(.subheadline, weight: .semibold))
                         .foregroundStyle(.primary)
 
-                    Text("\(resourcesCount) ressources • \(promptsCount) prompts")
+                    Text("~\(estimatedContextTokens) tok • \(resourcesCount) res • \(promptsCount) prm")
                         .font(.system(.caption2))
+                        .monospacedDigit()
                         .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .help("Coût estimé du schéma MCP envoyé à l'IA (~tokens par tour)")
                 }
             }
         }

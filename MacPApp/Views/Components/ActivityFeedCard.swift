@@ -5,6 +5,7 @@ import SwiftUI
 struct ActivityFeedCard: View {
     let entries: [AuditEntry]
     let onOpenFullLog: () -> Void
+    let onSelectEntry: (AuditEntry) -> Void
 
     private static let timeFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
@@ -47,7 +48,9 @@ struct ActivityFeedCard: View {
                 } else {
                     VStack(spacing: 5) {
                         ForEach(entries.prefix(5)) { entry in
-                            Button(action: onOpenFullLog) {
+                            Button {
+                                onSelectEntry(entry)
+                            } label: {
                                 ActivityRow(entry: entry, timeFormatter: Self.timeFormatter)
                             }
                             .buttonStyle(.plain)

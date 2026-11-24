@@ -8,7 +8,7 @@ public struct ClipboardTool: MCPTool {
     public let shortSubtitle = "Contenu texte copié"
     public let symbolName = "doc.on.clipboard"
     public let category: ToolCategory = .productivity
-    public let description = "Reads the current plain-text content from the macOS general clipboard (NSPasteboard.general)."
+    public let description = "Reads plain text from the macOS clipboard (NSPasteboard.general)."
     public let sensitivity: ToolSensitivity = .sensitive
     public let permissionReason = "Un client IA souhaite lire le contenu actuel de votre presse-papiers macOS."
 
@@ -30,7 +30,7 @@ public struct ClipboardTool: MCPTool {
             "properties": [
                 "max_length": [
                     "type": "integer",
-                    "description": "Maximum number of characters to return (default: 50000, max: 200000).",
+                    "description": "Max characters (default: 16000, max: 200000).",
                     "minimum": 1,
                     "maximum": 200000
                 ]
@@ -48,7 +48,7 @@ public struct ClipboardTool: MCPTool {
     }
 
     public func execute(arguments: [String: JSONValue]) async throws -> MCPCallToolResult {
-        let requestedMax = arguments["max_length"]?.intValue ?? 50_000
+        let requestedMax = arguments["max_length"]?.intValue ?? 16_000
         let maxLength = min(max(requestedMax, 1), 200_000)
 
         let snapshot: (text: String?, typesCount: Int) = await MainActor.run {
@@ -92,7 +92,7 @@ public struct WriteClipboardTool: MCPTool {
     public let shortSubtitle = "Copier du texte"
     public let symbolName = "clipboard.fill"
     public let category: ToolCategory = .productivity
-    public let description = "Replaces the macOS general clipboard with the provided UTF-8 text."
+    public let description = "Copies UTF-8 text to the macOS clipboard."
     public let sensitivity: ToolSensitivity = .sensitive
     public let permissionReason = "Un client IA souhaite remplacer le contenu de votre presse-papiers macOS."
 
@@ -114,7 +114,7 @@ public struct WriteClipboardTool: MCPTool {
             "properties": [
                 "text": [
                     "type": "string",
-                    "description": "UTF-8 text to copy to the macOS clipboard."
+                    "description": "UTF-8 text to copy."
                 ]
             ],
             "required": ["text"],

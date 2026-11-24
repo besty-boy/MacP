@@ -2,8 +2,8 @@ import Dispatch
 import Foundation
 import MacPCore
 
-/// Custom entry point routing `--stdio` invocations directly to the lightweight MCP bridge
-/// without initializing AppKit/SwiftUI, while launching the Menu Bar app for normal launches.
+/// Custom entry point routing `--stdio` and CLI utility flags directly without initializing AppKit/SwiftUI,
+/// while launching the Menu Bar app for normal GUI launches.
 @main
 struct MacPMain {
     static func main() {
@@ -11,13 +11,14 @@ struct MacPMain {
 
         if args.contains("--help") || args.contains("-h") {
             let usage = """
-            MacP — Native macOS MCP Bridge (v2.0.0)
+            MacP — Native macOS MCP Bridge (v\(MacPVersion.current))
 
             Usage:
               MacP                        Launch the macOS Menu Bar app & local MCP bridge daemon
-              MacP --stdio [options]      Run as a stdio MCP bridge for Antigravity / Claude Desktop / Cursor
+              MacP --stdio [options]      Run as a stdio MCP bridge for Antigravity / Claude / Cursor / Windsurf
+              MacP --status [options]     Check if the MacP.app Unix socket daemon is reachable
 
-            Options for --stdio:
+            Options:
               --socket <path>             Custom Unix domain socket path (default: ~/Library/Application Support/MacP/macp.sock)
               --standalone                Run MCP server directly in-process without connecting to MacP.app
               --no-autolaunch             Do not automatically launch MacP.app if the socket is unavailable
@@ -25,21 +26,29 @@ struct MacPMain {
               --version, -v               Print version information
               --help, -h                  Print this help message
             """
-            if let data = (usage + "\n").data(using: .utf8) {
-                FileHandle.standardError.write(data)
-            }
+            writeStderr(usage + "\n")
             exit(0)
         }
 
         if args.contains("--version") || args.contains("-v") {
-            if let data = "MacP 2.0.0\n".data(using: .utf8) {
-                FileHandle.standardOutput.write(data)
-            }
+            writeStdout("MacP \(MacPVersion.current)\n")
             exit(0)
         }
 
+        let options = StdioCLIOptions.parse(args)
+
+        if args.contains("--status") {
+            let reachable = UnixSocketServer.canConnect(path: options.socketPath)
+            if reachable {
+                writeStdout("MacP \(MacPVersion.current): listening on \(options.socketPath)\n")
+                exit(0)
+            } else {
+                writeStderr("MacP \(MacPVersion.current): not reachable at \(options.socketPath)\n")
+                exit(1)
+            }
+        }
+
         if args.contains("--stdio") {
-            let options = StdioCLIOptions.parse(args)
             Task {
                 let code = await StdioBridgeRunner.run(options: options)
                 exit(code)
@@ -48,6 +57,18 @@ struct MacPMain {
         }
 
         MacPMenuBarApp.main()
+    }
+
+    private static func writeStdout(_ text: String) {
+        if let data = text.data(using: .utf8) {
+            FileHandle.standardOutput.write(data)
+        }
+    }
+
+    private static func writeStderr(_ text: String) {
+        if let data = text.data(using: .utf8) {
+            FileHandle.standardError.write(data)
+        }
     }
 }
 
@@ -118,8 +139,10 @@ private enum StdioBridgeRunner {
         launcher.standardError = FileHandle.nullDevice
         try? launcher.run()
 
-        for _ in 0..<15 {
-            try? await Task.sleep(for: .milliseconds(150))
+        // Fast adaptive backoff: attaches in ~40-80ms on warm launches, tolerates up to ~5s on cold macOS boot.
+        let retryDelaysMs: [Int] = [40, 60, 80, 100, 120, 150, 150, 200, 200, 250, 250, 300, 300, 400, 400, 500, 500, 500, 500]
+        for delayMs in retryDelaysMs {
+            try? await Task.sleep(for: .milliseconds(delayMs))
             if let socket = try? UnixSocketClient.connect(path: socketPath) {
                 return socket
             }

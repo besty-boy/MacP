@@ -17,6 +17,8 @@ let package = Package(
             name: "MacPCore",
             linkerSettings: [
                 .linkedFramework("AppKit"),
+                .linkedFramework("AudioToolbox"),
+                .linkedFramework("CoreAudio"),
                 .linkedFramework("EventKit"),
                 .linkedFramework("IOKit")
             ]

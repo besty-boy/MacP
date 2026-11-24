@@ -7,7 +7,7 @@ public struct ListShortcutsTool: MCPTool {
     public let shortSubtitle = "Découvrir les Raccourcis"
     public let symbolName = "list.bullet.rectangle"
     public let category: ToolCategory = .productivity
-    public let description = "Lists all installed macOS Shortcuts (optionally filtered by folder name) using /usr/bin/shortcuts list."
+    public let description = "Lists installed macOS Shortcuts (optionally filtered by folder)."
     public let sensitivity: ToolSensitivity = .standard
     public let permissionReason = "Lecture seule des noms de Raccourcis disponibles sur ce Mac."
 
@@ -38,7 +38,7 @@ public struct ListShortcutsTool: MCPTool {
             "properties": [
                 "folder": [
                     "type": "string",
-                    "description": "Optional Shortcuts folder name to filter results."
+                    "description": "Optional Shortcuts folder filter."
                 ]
             ],
             "additionalProperties": false
@@ -96,7 +96,7 @@ public struct ShortcutTool: MCPTool {
     public let shortSubtitle = "Lancer un Raccourci macOS"
     public let symbolName = "square.2.layers.3d.top.filled"
     public let category: ToolCategory = .productivity
-    public let description = "Executes an existing macOS Shortcut by name using the native /usr/bin/shortcuts CLI and returns its output."
+    public let description = "Runs a macOS Shortcut by name and returns its stdout/stderr."
     public let sensitivity: ToolSensitivity = .sensitive
     public let permissionReason = "Un client IA souhaite exécuter un Raccourci macOS pouvant déclencher des automatisations système ou modifier des fichiers."
 
@@ -127,11 +127,11 @@ public struct ShortcutTool: MCPTool {
             "properties": [
                 "shortcut_name": [
                     "type": "string",
-                    "description": "Exact name of the macOS Shortcut to run."
+                    "description": "Exact macOS Shortcut name."
                 ],
                 "input_text": [
                     "type": "string",
-                    "description": "Optional UTF-8 text passed to the shortcut via standard input."
+                    "description": "Optional stdin text."
                 ]
             ],
             "required": ["shortcut_name"],

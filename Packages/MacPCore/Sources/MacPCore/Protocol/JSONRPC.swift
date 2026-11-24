@@ -134,6 +134,19 @@ public struct JSONRPCResponse: Sendable, Equatable, Codable {
     }
 }
 
+/// Zero-roundtrip typed JSON-RPC 2.0 success response encoded directly without building a `JSONValue` tree.
+public struct DirectJSONRPCResponse<Result: Encodable & Sendable>: Sendable, Encodable {
+    public let jsonrpc: String
+    public let id: JSONRPCID
+    public let result: Result
+
+    public init(id: JSONRPCID, result: Result) {
+        self.jsonrpc = "2.0"
+        self.id = id
+        self.result = result
+    }
+}
+
 /// Outgoing JSON-RPC 2.0 notification (no id).
 public struct JSONRPCNotification: Sendable, Equatable, Codable {
     public let jsonrpc: String
@@ -159,9 +172,27 @@ public enum JSONRPCCodec {
     }
 
     /// Encodes a Codable message as a single newline-terminated UTF-8 JSON line (NDJSON).
-    public static func encodeLine<T: Encodable>(_ value: T) throws -> Data {
-        var data = try makeEncoder().encode(value)
+    public static func encodeLine<T: Encodable>(_ value: T, using encoder: JSONEncoder? = nil) throws -> Data {
+        var data = try (encoder ?? makeEncoder()).encode(value)
         data.append(0x0A) // '\n'
         return data
+    }
+
+    /// Encodes a typed JSON-RPC 2.0 success response directly into a single NDJSON line.
+    public static func encodeResponseLine<Result: Encodable & Sendable>(
+        id: JSONRPCID,
+        result: Result,
+        using encoder: JSONEncoder? = nil
+    ) throws -> Data {
+        try encodeLine(DirectJSONRPCResponse(id: id, result: result), using: encoder)
+    }
+
+    /// Encodes a JSON-RPC 2.0 error response directly into a single NDJSON line.
+    public static func encodeErrorLine(
+        id: JSONRPCID,
+        error: JSONRPCError,
+        using encoder: JSONEncoder? = nil
+    ) throws -> Data {
+        try encodeLine(JSONRPCResponse(id: id, error: error), using: encoder)
     }
 }

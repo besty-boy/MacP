@@ -2,13 +2,13 @@ import AppKit
 import MacPCore
 import SwiftUI
 
-/// Two-pane local Audit Log & JSON Payload Inspector window with search, outcome filtering, and JSON/CSV export.
+/// Two-pane local Audit Log & JSON Payload Inspector window with search, outcome filtering,
+/// token/size metrics, human pretty-printing of compact JSON, and JSON/CSV export.
 struct AuditLogSheetView: View {
-    let appState: AppState
+    @Bindable var appState: AppState
 
     @State private var searchText = ""
     @State private var outcomeFilter: OutcomeFilter = .all
-    @State private var selectedEntryID: UUID?
 
     private enum OutcomeFilter: String, CaseIterable, Identifiable {
         case all = "Tous"
@@ -40,7 +40,7 @@ struct AuditLogSheetView: View {
     }
 
     private var selectedEntry: AuditEntry? {
-        if let id = selectedEntryID, let match = filteredEntries.first(where: { $0.id == id }) {
+        if let id = appState.selectedAuditEntryID, let match = filteredEntries.first(where: { $0.id == id }) {
             return match
         }
         return filteredEntries.first
@@ -95,7 +95,7 @@ struct AuditLogSheetView: View {
             } else {
                 HSplitView {
                     // Left List
-                    List(filteredEntries, selection: $selectedEntryID) { entry in
+                    List(filteredEntries, selection: $appState.selectedAuditEntryID) { entry in
                         AuditSummaryRow(entry: entry)
                             .tag(entry.id)
                     }
@@ -178,6 +178,11 @@ private struct AuditSummaryRow: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                 Spacer()
+                if entry.estimatedResponseTokens > 0 {
+                    Text("~\(entry.estimatedResponseTokens) tok")
+                        .font(.system(size: 9.5, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
                 Text(entry.timestamp.formatted(date: .omitted, time: .standard))
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
@@ -206,6 +211,12 @@ private struct AuditPayloadInspector: View {
         }
     }
 
+    private var payloadMetricText: String? {
+        guard let bytes = entry.responseBytes, bytes > 0 else { return nil }
+        let formattedSize = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+        return "\(formattedSize) • ~\(entry.estimatedResponseTokens) tok"
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
@@ -218,22 +229,29 @@ private struct AuditPayloadInspector: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Text("\(outcomeLabel) • \(entry.durationMs) ms")
-                        .font(.system(.caption, weight: .semibold))
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 4)
-                        .background(outcomeColor.opacity(0.16), in: Capsule())
-                        .foregroundStyle(outcomeColor)
+                    VStack(alignment: .trailing, spacing: 4) {
+                        Text("\(outcomeLabel) • \(entry.durationMs) ms")
+                            .font(.system(.caption, weight: .semibold))
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(outcomeColor.opacity(0.16), in: Capsule())
+                            .foregroundStyle(outcomeColor)
+                        if let metric = payloadMetricText {
+                            Text(metric)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
 
                 InspectorCodeBlock(
                     title: "Arguments JSON",
-                    content: entry.argumentsJSON ?? entry.argumentsSummary
+                    content: TokenEstimator.prettyPrintJSONIfValid(entry.argumentsJSON ?? entry.argumentsSummary)
                 )
 
                 InspectorCodeBlock(
                     title: "Résultat / Détail",
-                    content: entry.resultPreview ?? entry.detail
+                    content: TokenEstimator.prettyPrintJSONIfValid(entry.resultPreview ?? entry.detail)
                 )
             }
             .padding(16)

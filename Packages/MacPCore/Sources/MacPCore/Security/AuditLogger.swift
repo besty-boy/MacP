@@ -19,6 +19,7 @@ public struct AuditEntry: Sendable, Codable, Equatable, Identifiable {
     public let durationMs: Int
     public let detail: String
     public let resultPreview: String?
+    public let responseBytes: Int?
 
     public init(
         id: UUID = UUID(),
@@ -31,7 +32,8 @@ public struct AuditEntry: Sendable, Codable, Equatable, Identifiable {
         outcome: AuditOutcome,
         durationMs: Int = 0,
         detail: String = "",
-        resultPreview: String? = nil
+        resultPreview: String? = nil,
+        responseBytes: Int? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -44,15 +46,34 @@ public struct AuditEntry: Sendable, Codable, Equatable, Identifiable {
         self.durationMs = durationMs
         self.detail = detail
         self.resultPreview = resultPreview
+        self.responseBytes = responseBytes
+    }
+
+    public var estimatedResponseTokens: Int {
+        if let responseBytes {
+            return TokenEstimator.estimate(utf8Bytes: responseBytes)
+        }
+        if let resultPreview {
+            return TokenEstimator.estimate(text: resultPreview)
+        }
+        return 0
     }
 }
 
 /// Local-first JSONL audit logger storing every AI action in `~/Library/Logs/MacP/audit.jsonl`.
+/// - O(1) in-memory append (no array shifting on every record).
+/// - Tail-reads only the last 512 KiB on launch (O(1) startup memory regardless of log history).
+/// - Persistent append `FileHandle` with automatic log rotation (5 MiB cap + 1 backup).
 public actor AuditLogger {
     public nonisolated let logFileURL: URL
     private let maxInMemoryEntries: Int
-    private var entries: [AuditEntry] = []
+    private let maxFileBytes: UInt64
+
+    /// Stored chronologically (oldest -> newest) for O(1) append; exposed newest-first.
+    private var chronologicalEntries: [AuditEntry] = []
     private var observers: [UUID: AsyncStream<AuditEntry>.Continuation] = [:]
+    private var fileHandle: FileHandle?
+    private var currentFileSize: UInt64 = 0
 
     private let encoder: JSONEncoder = {
         let enc = JSONEncoder()
@@ -77,17 +98,28 @@ public actor AuditLogger {
 
     public init(
         logFileURL: URL = AuditLogger.defaultLogFileURL,
-        maxInMemoryEntries: Int = 500
+        maxInMemoryEntries: Int = 500,
+        maxFileBytes: UInt64 = 5 * 1024 * 1024
     ) {
         self.logFileURL = logFileURL
-        self.maxInMemoryEntries = maxInMemoryEntries
-        self.entries = Self.loadExistingEntries(from: logFileURL, limit: maxInMemoryEntries, decoder: decoder)
+        self.maxInMemoryEntries = max(1, maxInMemoryEntries)
+        self.maxFileBytes = max(4096, maxFileBytes)
+        let loadedNewestFirst = Self.loadTailEntries(from: logFileURL, limit: self.maxInMemoryEntries, decoder: decoder)
+        self.chronologicalEntries = loadedNewestFirst.reversed()
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: logFileURL.path),
+           let size = attrs[.size] as? UInt64 {
+            self.currentFileSize = size
+        }
+    }
+
+    deinit {
+        try? fileHandle?.close()
     }
 
     public func record(_ entry: AuditEntry) {
-        entries.insert(entry, at: 0)
-        if entries.count > maxInMemoryEntries {
-            entries.removeLast(entries.count - maxInMemoryEntries)
+        chronologicalEntries.append(entry)
+        if chronologicalEntries.count > maxInMemoryEntries {
+            chronologicalEntries.removeFirst(chronologicalEntries.count - maxInMemoryEntries)
         }
 
         appendToDisk(entry)
@@ -98,31 +130,33 @@ public actor AuditLogger {
     }
 
     public func recentEntries(limit: Int = 5) -> [AuditEntry] {
-        Array(entries.prefix(max(0, limit)))
+        guard limit > 0 else { return [] }
+        return Array(chronologicalEntries.suffix(limit).reversed())
     }
 
     public func allLoadedEntries() -> [AuditEntry] {
-        entries
+        Array(chronologicalEntries.reversed())
     }
 
     public func exportJSON() throws -> Data {
         let prettyEncoder = JSONEncoder()
         prettyEncoder.dateEncodingStrategy = .iso8601
         prettyEncoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        return try prettyEncoder.encode(entries)
+        return try prettyEncoder.encode(Array(chronologicalEntries.reversed()))
     }
 
     public func exportCSV() -> String {
-        let iso = ISO8601DateFormatter()
-        var lines = ["timestamp,client,method,tool,outcome,duration_ms,arguments,detail"]
-        for e in entries {
+        var lines = ["timestamp,client,method,tool,outcome,duration_ms,response_bytes,arguments,detail"]
+        lines.reserveCapacity(chronologicalEntries.count + 1)
+        for e in chronologicalEntries.reversed() {
             let row = [
-                iso.string(from: e.timestamp),
+                ISO8601Codec.format(e.timestamp),
                 e.clientName,
                 e.method,
                 e.toolName ?? "",
                 e.outcome.rawValue,
                 String(e.durationMs),
+                e.responseBytes.map(String.init) ?? "",
                 e.argumentsSummary,
                 e.detail
             ].map(Self.csvEscape).joined(separator: ",")
@@ -132,8 +166,13 @@ public actor AuditLogger {
     }
 
     public func clear() {
-        entries.removeAll()
+        chronologicalEntries.removeAll()
+        try? fileHandle?.close()
+        fileHandle = nil
+        currentFileSize = 0
         try? Data().write(to: logFileURL, options: .atomic)
+        let backupURL = rotatedBackupURL()
+        try? FileManager.default.removeItem(at: backupURL)
     }
 
     public func subscribe() -> AsyncStream<AuditEntry> {
@@ -151,47 +190,111 @@ public actor AuditLogger {
     }
 
     private static func csvEscape(_ value: String) -> String {
-        let cleaned = value.replacingOccurrences(of: "\n", with: " ")
+        let cleaned = value
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
         if cleaned.contains(",") || cleaned.contains("\"") {
             return "\"" + cleaned.replacingOccurrences(of: "\"", with: "\"\"") + "\""
         }
         return cleaned
     }
 
+    private func rotatedBackupURL() -> URL {
+        let base = logFileURL.deletingPathExtension().lastPathComponent
+        let ext = logFileURL.pathExtension
+        let name = ext.isEmpty ? "\(base).1" : "\(base).1.\(ext)"
+        return logFileURL.deletingLastPathComponent().appendingPathComponent(name)
+    }
+
+    private func rotateIfNeeded(adding incomingBytes: UInt64) {
+        guard currentFileSize + incomingBytes > maxFileBytes else { return }
+
+        try? fileHandle?.close()
+        fileHandle = nil
+
+        let fm = FileManager.default
+        let backup = rotatedBackupURL()
+        try? fm.removeItem(at: backup)
+        if fm.fileExists(atPath: logFileURL.path) {
+            try? fm.moveItem(at: logFileURL, to: backup)
+        }
+        currentFileSize = 0
+    }
+
+    private func ensureAppendHandle() throws -> FileHandle {
+        if let existing = fileHandle {
+            return existing
+        }
+
+        let fm = FileManager.default
+        let directory = logFileURL.deletingLastPathComponent()
+        try fm.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        if !fm.fileExists(atPath: logFileURL.path) {
+            fm.createFile(
+                atPath: logFileURL.path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            )
+            currentFileSize = 0
+        }
+
+        let handle = try FileHandle(forWritingTo: logFileURL)
+        currentFileSize = try handle.seekToEnd()
+        fileHandle = handle
+        return handle
+    }
+
     private func appendToDisk(_ entry: AuditEntry) {
         do {
-            let directory = logFileURL.deletingLastPathComponent()
-            try FileManager.default.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-
             var data = try encoder.encode(entry)
             data.append(0x0A)
 
-            if FileManager.default.fileExists(atPath: logFileURL.path) {
-                let handle = try FileHandle(forWritingTo: logFileURL)
-                defer { try? handle.close() }
-                try handle.seekToEnd()
-                try handle.write(contentsOf: data)
-            } else {
-                try data.write(to: logFileURL, options: .atomic)
-                try? FileManager.default.setAttributes(
-                    [.posixPermissions: 0o600],
-                    ofItemAtPath: logFileURL.path
-                )
-            }
+            rotateIfNeeded(adding: UInt64(data.count))
+            let handle = try ensureAppendHandle()
+            try handle.write(contentsOf: data)
+            currentFileSize += UInt64(data.count)
         } catch {
+            // Reset handle in case the underlying file was moved/deleted externally.
+            try? fileHandle?.close()
+            fileHandle = nil
             DiagnosticLog.write("Failed to append audit entry: \(error.localizedDescription)")
         }
     }
 
-    private static func loadExistingEntries(from url: URL, limit: Int, decoder: JSONDecoder) -> [AuditEntry] {
-        guard let content = try? String(contentsOf: url, encoding: .utf8) else {
+    /// Reads at most the trailing `maxReadBytes` of the JSONL file so startup stays fast and memory-bounded.
+    private static func loadTailEntries(
+        from url: URL,
+        limit: Int,
+        decoder: JSONDecoder,
+        maxReadBytes: UInt64 = 512 * 1024
+    ) -> [AuditEntry] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
             return []
         }
-        let lines = content.split(whereSeparator: \.isNewline)
+        defer { try? handle.close() }
+
+        guard let fileSize = try? handle.seekToEnd(), fileSize > 0 else {
+            return []
+        }
+
+        let startOffset = fileSize > maxReadBytes ? (fileSize - maxReadBytes) : 0
+        try? handle.seek(toOffset: startOffset)
+        guard let tailData = try? handle.readToEnd(), !tailData.isEmpty else {
+            return []
+        }
+
+        let content = String(decoding: tailData, as: UTF8.self)
+        var lines = content.split(whereSeparator: \.isNewline)
+        // If we started mid-file, drop the first potentially truncated line fragment.
+        if startOffset > 0 && !lines.isEmpty {
+            lines.removeFirst()
+        }
+
         var parsed: [AuditEntry] = []
         parsed.reserveCapacity(min(lines.count, limit))
 
@@ -208,8 +311,17 @@ public actor AuditLogger {
 }
 
 /// File-based diagnostic logger that NEVER touches `stdout` (safe during MCP stdio sessions).
+/// Reuses an open handle and automatically rotates once the file reaches 2 MiB.
 public enum DiagnosticLog {
     private static let queue = DispatchQueue(label: "com.macp.diagnostic-log", qos: .utility)
+    private static let maxLogBytes: UInt64 = 2 * 1024 * 1024
+
+    private final class Sink: @unchecked Sendable {
+        var handle: FileHandle?
+        var path: String?
+        var size: UInt64 = 0
+    }
+    private static let sink = Sink()
 
     public static var logFileURL: URL {
         let logsDir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first?
@@ -221,22 +333,55 @@ public enum DiagnosticLog {
 
     public static func write(_ message: String, fileURL: URL? = nil) {
         let targetURL = fileURL ?? logFileURL
-        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let timestamp = ISO8601Codec.format(Date())
         let line = "[\(timestamp)] \(message)\n"
         queue.async {
             do {
-                let dir = targetURL.deletingLastPathComponent()
-                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                 guard let data = line.data(using: .utf8) else { return }
-                if FileManager.default.fileExists(atPath: targetURL.path) {
+                let fm = FileManager.default
+                let isCustomTarget = (fileURL != nil)
+
+                if !isCustomTarget {
+                    if sink.path != targetURL.path || sink.handle == nil {
+                        try? sink.handle?.close()
+                        sink.handle = nil
+                        try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                        if !fm.fileExists(atPath: targetURL.path) {
+                            fm.createFile(atPath: targetURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+                        }
+                        let handle = try FileHandle(forWritingTo: targetURL)
+                        sink.size = try handle.seekToEnd()
+                        sink.handle = handle
+                        sink.path = targetURL.path
+                    }
+
+                    if sink.size + UInt64(data.count) > maxLogBytes {
+                        try? sink.handle?.close()
+                        sink.handle = nil
+                        let backup = targetURL.deletingLastPathComponent().appendingPathComponent("macp.1.log")
+                        try? fm.removeItem(at: backup)
+                        try? fm.moveItem(at: targetURL, to: backup)
+                        fm.createFile(atPath: targetURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+                        let handle = try FileHandle(forWritingTo: targetURL)
+                        sink.handle = handle
+                        sink.size = 0
+                    }
+
+                    try sink.handle?.write(contentsOf: data)
+                    sink.size += UInt64(data.count)
+                } else {
+                    try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    if !fm.fileExists(atPath: targetURL.path) {
+                        fm.createFile(atPath: targetURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+                    }
                     let handle = try FileHandle(forWritingTo: targetURL)
                     defer { try? handle.close() }
                     try handle.seekToEnd()
                     try handle.write(contentsOf: data)
-                } else {
-                    try data.write(to: targetURL, options: .atomic)
                 }
             } catch {
+                try? sink.handle?.close()
+                sink.handle = nil
                 // Intentionally silent: never write diagnostic failures to stdout.
             }
         }

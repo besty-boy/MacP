@@ -1,13 +1,14 @@
 import MacPCore
 import SwiftUI
 
-/// Rich Bento row controlling an individual MCP tool's toggle, approval policy, and active permission grant.
+/// Rich Bento row controlling an individual MCP tool's toggle, approval policy, token cost, and active permission grant.
 struct ToolToggleTile: View {
     let tool: MCPToolMetadata
     let isEnabled: Bool
     let policy: ToolPermissionPolicy
     let isAlwaysAllowed: Bool
     let leaseMinutesRemaining: Int?
+    let estimatedTokens: Int
     let onToggle: (Bool) -> Void
     let onPolicyChange: (ToolPermissionPolicy) -> Void
     let onRevokePermission: () -> Void
@@ -68,9 +69,9 @@ struct ToolToggleTile: View {
                     .controlSize(.mini)
                 }
 
-                // Governance & Permission Bar
+                // Governance, Token Cost & Permission Bar
                 HStack(spacing: 6) {
-                    Text(tool.name)
+                    Text("\(tool.name) • ~\(estimatedTokens) tok")
                         .font(.system(size: 9.5, design: .monospaced))
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
@@ -78,17 +79,21 @@ struct ToolToggleTile: View {
                     Spacer(minLength: 4)
 
                     if let mins = leaseMinutesRemaining {
-                        HStack(spacing: 3) {
-                            Image(systemName: "timer")
-                                .font(.system(size: 9))
-                            Text("\(mins)m")
-                                .font(.system(size: 9.5, weight: .semibold))
+                        Button(action: onRevokePermission) {
+                            HStack(spacing: 3) {
+                                Image(systemName: "timer")
+                                    .font(.system(size: 9))
+                                Text("\(mins)m")
+                                    .font(.system(size: 9.5, weight: .semibold))
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 8, weight: .bold))
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.blue.opacity(0.14), in: Capsule())
+                            .foregroundStyle(.blue)
                         }
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.blue.opacity(0.14), in: Capsule())
-                        .foregroundStyle(.blue)
-                        .onTapGesture(perform: onRevokePermission)
+                        .buttonStyle(.plain)
                         .help("Autorisation temporaire active — cliquer pour révoquer")
                     } else if isAlwaysAllowed && policy == .askOnce {
                         Button(action: onRevokePermission) {
@@ -140,7 +145,7 @@ struct ToolToggleTile: View {
                     .fixedSize()
                 }
             }
-            .opacity(isEnabled ? 1.0 : 0.68)
+            .opacity(isEnabled ? 1.0 : 0.65)
         }
     }
 

@@ -25,7 +25,8 @@ public struct ConnectedClientInfo: Sendable, Equatable, Identifiable {
 }
 
 /// Handles a single MCP JSON-RPC 2.0 session over any `NDJSONTransport`,
-/// supporting Tools (with annotations), Resources (`macos://...`), and Prompts.
+/// supporting concurrent request execution, `notifications/cancelled`, single-pass JSON encoding,
+/// Tools (with annotations), Resources (`macos://...`), and Prompts.
 public actor MCPServerSession {
     public let sessionID: UUID
     public let serverInfo: MCPImplementationInfo
@@ -39,13 +40,17 @@ public actor MCPServerSession {
     private let transport: any NDJSONTransport
     private let onClientUpdated: (@Sendable (ConnectedClientInfo) async -> Void)?
 
+    private let decoder: JSONDecoder = JSONRPCCodec.makeDecoder()
+    private let encoder: JSONEncoder = JSONRPCCodec.makeEncoder()
+
     private var clientInfo: ConnectedClientInfo
     private var negotiatedProtocolVersion: String = MCPProtocolVersion.latest
     private var isInitialized = false
+    private var inFlightTasks: [JSONRPCID: Task<Void, Never>] = [:]
 
     public init(
         sessionID: UUID = UUID(),
-        serverInfo: MCPImplementationInfo = MCPImplementationInfo(name: "MacP", version: "2.0.0"),
+        serverInfo: MCPImplementationInfo = MCPImplementationInfo(name: "MacP", version: MacPVersion.current),
         registry: MCPToolRegistry,
         resourceCatalog: MCPResourceCatalog = MCPResourceCatalog(),
         promptCatalog: MCPPromptCatalog = MCPPromptCatalog(),
@@ -69,29 +74,93 @@ public actor MCPServerSession {
     }
 
     /// Runs the JSON-RPC message processing loop until the transport reaches EOF or closes.
+    /// Tool/resource calls execute concurrently so slow operations never head-of-line block `ping` or `notifications/cancelled`.
     public func run() async {
         DiagnosticLog.write("MCP session \(sessionID.uuidString.prefix(8)) started")
 
         for await rawLine in transport.incomingLines() {
-            if let response = await handleRawMessage(rawLine) {
-                do {
-                    let encoded = try JSONRPCCodec.encodeLine(response)
-                    try await transport.sendLine(encoded)
-                } catch {
-                    DiagnosticLog.write("Failed to write MCP response: \(error.localizedDescription)")
-                    break
-                }
+            let request: JSONRPCRequest
+            do {
+                request = try decoder.decode(JSONRPCRequest.self, from: rawLine)
+            } catch {
+                await sendEncodedLine(try? JSONRPCCodec.encodeErrorLine(
+                    id: .null,
+                    error: .parseError(error.localizedDescription),
+                    using: encoder
+                ))
+                continue
             }
+
+            guard request.jsonrpc == "2.0" else {
+                if let id = request.id {
+                    await sendEncodedLine(try? JSONRPCCodec.encodeErrorLine(
+                        id: id,
+                        error: .invalidRequest("jsonrpc must be '2.0'"),
+                        using: encoder
+                    ))
+                }
+                continue
+            }
+
+            if request.isNotification {
+                handleNotification(request)
+                continue
+            }
+
+            guard let requestID = request.id else { continue }
+
+            // Process `initialize` synchronously to establish protocol version & client identity before any tool calls.
+            if request.method == "initialize" {
+                let encoded = await executeDirectLine(request: request, id: requestID)
+                await sendEncodedLine(encoded)
+                continue
+            }
+
+            // Fast synchronous metadata queries avoid task spawn overhead.
+            switch request.method {
+            case "ping", "tools/list", "resources/list", "resources/templates/list", "prompts/list", "prompts/get":
+                let encoded = await executeDirectLine(request: request, id: requestID)
+                await sendEncodedLine(encoded)
+                continue
+            default:
+                break
+            }
+
+            // Concurrent execution for potentially long-running calls (`tools/call`, `resources/read`).
+            inFlightTasks[requestID]?.cancel()
+            let task = Task { [weak self] in
+                guard let self else { return }
+                let encoded = await self.executeDirectLine(request: request, id: requestID)
+                if !Task.isCancelled {
+                    await self.sendEncodedLine(encoded)
+                }
+                await self.clearInFlightTask(for: requestID)
+            }
+            inFlightTasks[requestID] = task
+        }
+
+        // On half-closed stdio pipes (e.g. piped CLI commands), let in-flight requests finish writing to stdout.
+        // On full-duplex socket disconnects, cancel in-flight work immediately so no orphaned subprocesses keep running.
+        let remaining = Array(inFlightTasks.values)
+        inFlightTasks.removeAll()
+        if !transport.supportsHalfClose {
+            for task in remaining {
+                task.cancel()
+            }
+        }
+        for task in remaining {
+            await task.value
         }
 
         DiagnosticLog.write("MCP session \(sessionID.uuidString.prefix(8)) ended (\(clientInfo.displayLabel))")
     }
 
-    /// Processes a single raw UTF-8 JSON-RPC 2.0 payload and returns an optional response (nil for notifications).
+    /// Processes a single raw UTF-8 JSON-RPC 2.0 payload and returns an optional `JSONRPCResponse` (nil for notifications).
+    /// Useful for direct invocation and unit tests.
     public func handleRawMessage(_ rawLine: Data) async -> JSONRPCResponse? {
         let request: JSONRPCRequest
         do {
-            request = try JSONRPCCodec.makeDecoder().decode(JSONRPCRequest.self, from: rawLine)
+            request = try decoder.decode(JSONRPCRequest.self, from: rawLine)
         } catch {
             return JSONRPCResponse(
                 id: .null,
@@ -107,14 +176,23 @@ public actor MCPServerSession {
             )
         }
 
-        return await route(request: request)
+        if request.isNotification {
+            handleNotification(request)
+            return nil
+        }
+
+        guard let requestID = request.id else { return nil }
+        guard let encodedLine = await executeDirectLine(request: request, id: requestID) else {
+            return nil
+        }
+        return try? decoder.decode(JSONRPCResponse.self, from: encodedLine)
     }
 
     /// Sends a `notifications/tools/list_changed` notification to this client when toggles or Shield Mode change.
     public func sendToolsListChangedNotification() async {
         guard isInitialized else { return }
         let notification = JSONRPCNotification(method: "notifications/tools/list_changed")
-        guard let encoded = try? JSONRPCCodec.encodeLine(notification) else { return }
+        guard let encoded = try? JSONRPCCodec.encodeLine(notification, using: encoder) else { return }
         try? await transport.sendLine(encoded)
     }
 
@@ -122,63 +200,88 @@ public actor MCPServerSession {
     public func sendResourcesListChangedNotification() async {
         guard isInitialized else { return }
         let notification = JSONRPCNotification(method: "notifications/resources/list_changed")
-        guard let encoded = try? JSONRPCCodec.encodeLine(notification) else { return }
+        guard let encoded = try? JSONRPCCodec.encodeLine(notification, using: encoder) else { return }
         try? await transport.sendLine(encoded)
     }
 
-    // MARK: - Routing
+    // MARK: - Single-Pass Direct Request Execution
 
-    private func route(request: JSONRPCRequest) async -> JSONRPCResponse? {
-        if request.isNotification {
-            await handleNotification(request)
-            return nil
-        }
+    private func clearInFlightTask(for id: JSONRPCID) {
+        inFlightTasks.removeValue(forKey: id)
+    }
 
-        guard let requestID = request.id else {
-            return nil
-        }
-
-        switch request.method {
-        case "initialize":
-            return await handleInitialize(id: requestID, params: request.params)
-        case "ping":
-            return JSONRPCResponse(id: requestID, result: .object([:]))
-        case "tools/list":
-            return handleToolsList(id: requestID)
-        case "tools/call":
-            return await handleToolsCall(id: requestID, params: request.params)
-        case "resources/list":
-            return handleResourcesList(id: requestID)
-        case "resources/read":
-            return await handleResourcesRead(id: requestID, params: request.params)
-        case "prompts/list":
-            return handlePromptsList(id: requestID)
-        case "prompts/get":
-            return handlePromptsGet(id: requestID, params: request.params)
-        default:
-            return JSONRPCResponse(id: requestID, error: .methodNotFound(request.method))
+    private func sendEncodedLine(_ data: Data?) async {
+        guard let data else { return }
+        do {
+            try await transport.sendLine(data)
+        } catch {
+            DiagnosticLog.write("Failed to write MCP response: \(error.localizedDescription)")
         }
     }
 
-    private func handleNotification(_ request: JSONRPCRequest) async {
+    private func handleNotification(_ request: JSONRPCRequest) {
         switch request.method {
         case "notifications/initialized":
             isInitialized = true
             DiagnosticLog.write("MCP client initialized: \(clientInfo.displayLabel)")
+
         case "notifications/cancelled":
-            break
+            if let params = request.params,
+               let cancelParams = try? decodeParams(params, as: MCPCancelledNotificationParams.self),
+               let runningTask = inFlightTasks.removeValue(forKey: cancelParams.requestId) {
+                runningTask.cancel()
+                DiagnosticLog.write("Cancelled MCP request \(cancelParams.requestId): \(cancelParams.reason ?? "client requested")")
+            }
+
         default:
             DiagnosticLog.write("Ignored MCP notification: \(request.method)")
         }
     }
 
-    private func handleInitialize(id: JSONRPCID, params: JSONValue?) async -> JSONRPCResponse {
+    /// Executes a request and serializes the response in a single JSON encoding pass (zero `JSONValue` round-trip).
+    private func executeDirectLine(request: JSONRPCRequest, id: JSONRPCID) async -> Data? {
+        switch request.method {
+        case "initialize":
+            return await handleInitialize(id: id, params: request.params)
+
+        case "ping":
+            return encodeDirectSuccess(id: id, result: [String: JSONValue]())
+
+        case "tools/list":
+            let definitions = registry.definitions(enabledUsing: settings)
+            return encodeDirectSuccess(id: id, result: MCPToolsListResult(tools: definitions))
+
+        case "tools/call":
+            return await handleToolsCall(id: id, params: request.params)
+
+        case "resources/list":
+            let defs = resourceCatalog.definitions(enabledUsing: settings, registry: registry)
+            return encodeDirectSuccess(id: id, result: MCPResourcesListResult(resources: defs))
+
+        case "resources/templates/list":
+            return encodeDirectSuccess(id: id, result: MCPResourceTemplatesListResult(resourceTemplates: []))
+
+        case "resources/read":
+            return await handleResourcesRead(id: id, params: request.params)
+
+        case "prompts/list":
+            return encodeDirectSuccess(id: id, result: MCPPromptsListResult(prompts: promptCatalog.definitions))
+
+        case "prompts/get":
+            return handlePromptsGet(id: id, params: request.params)
+
+        default:
+            return encodeDirectError(id: id, error: .methodNotFound(request.method))
+        }
+    }
+
+    private func handleInitialize(id: JSONRPCID, params: JSONValue?) async -> Data? {
         let initParams: MCPInitializeParams
         if let params {
             do {
-                initParams = try JSONValueBridge.fromJSONValue(params, as: MCPInitializeParams.self)
+                initParams = try decodeParams(params, as: MCPInitializeParams.self)
             } catch {
-                return JSONRPCResponse(id: id, error: .invalidParams(error.localizedDescription))
+                return encodeDirectError(id: id, error: .invalidParams(error.localizedDescription))
             }
         } else {
             initParams = MCPInitializeParams()
@@ -207,33 +310,28 @@ public actor MCPServerSession {
                 prompts: MCPPromptCapabilities(listChanged: false)
             ),
             serverInfo: serverInfo,
-            instructions: "MacP exposes native macOS productivity, workspace, vision, and automation tools plus live macos:// resources and prompts. Sensitive/critical actions require local user approval in the MacP menu bar app."
+            instructions: "Native macOS MCP bridge (tools, macos:// resources, prompts). Sensitive actions prompt locally in MacP."
         )
 
-        return encodeResult(id: id, value: result)
+        return encodeDirectSuccess(id: id, result: result)
     }
 
     // MARK: - Tools
 
-    private func handleToolsList(id: JSONRPCID) -> JSONRPCResponse {
-        let definitions = registry.definitions(enabledUsing: settings)
-        return encodeResult(id: id, value: MCPToolsListResult(tools: definitions))
-    }
-
-    private func handleToolsCall(id: JSONRPCID, params: JSONValue?) async -> JSONRPCResponse {
+    private func handleToolsCall(id: JSONRPCID, params: JSONValue?) async -> Data? {
         guard let params else {
-            return JSONRPCResponse(id: id, error: .invalidParams("Missing params for tools/call"))
+            return encodeDirectError(id: id, error: .invalidParams("Missing params for tools/call"))
         }
 
         let callParams: MCPCallToolParams
         do {
-            callParams = try JSONValueBridge.fromJSONValue(params, as: MCPCallToolParams.self)
+            callParams = try decodeParams(params, as: MCPCallToolParams.self)
         } catch {
-            return JSONRPCResponse(id: id, error: .invalidParams(error.localizedDescription))
+            return encodeDirectError(id: id, error: .invalidParams(error.localizedDescription))
         }
 
         guard let tool = registry.tool(named: callParams.name) else {
-            return JSONRPCResponse(id: id, error: .invalidParams("Unknown tool: \(callParams.name)"))
+            return encodeDirectError(id: id, error: .invalidParams("Unknown tool: \(callParams.name)"))
         }
 
         let arguments = callParams.arguments ?? [:]
@@ -243,31 +341,26 @@ public actor MCPServerSession {
             method: "tools/call",
             displayTarget: tool.name
         )
-        return encodeResult(id: id, value: toolResult)
+        return encodeDirectSuccess(id: id, result: toolResult)
     }
 
     // MARK: - Resources
 
-    private func handleResourcesList(id: JSONRPCID) -> JSONRPCResponse {
-        let defs = resourceCatalog.definitions(enabledUsing: settings, registry: registry)
-        return encodeResult(id: id, value: MCPResourcesListResult(resources: defs))
-    }
-
-    private func handleResourcesRead(id: JSONRPCID, params: JSONValue?) async -> JSONRPCResponse {
+    private func handleResourcesRead(id: JSONRPCID, params: JSONValue?) async -> Data? {
         guard let params else {
-            return JSONRPCResponse(id: id, error: .invalidParams("Missing params for resources/read"))
+            return encodeDirectError(id: id, error: .invalidParams("Missing params for resources/read"))
         }
 
         let readParams: MCPReadResourceParams
         do {
-            readParams = try JSONValueBridge.fromJSONValue(params, as: MCPReadResourceParams.self)
+            readParams = try decodeParams(params, as: MCPReadResourceParams.self)
         } catch {
-            return JSONRPCResponse(id: id, error: .invalidParams(error.localizedDescription))
+            return encodeDirectError(id: id, error: .invalidParams(error.localizedDescription))
         }
 
         guard let entry = resourceCatalog.entry(forURI: readParams.uri),
               let backingTool = registry.tool(named: entry.backingToolName) else {
-            return JSONRPCResponse(id: id, error: .invalidParams("Unknown resource URI: \(readParams.uri)"))
+            return encodeDirectError(id: id, error: .invalidParams("Unknown resource URI: \(readParams.uri)"))
         }
 
         let toolResult = await invokeTool(
@@ -279,7 +372,7 @@ public actor MCPServerSession {
 
         if toolResult.isError {
             let errMessage = toolResult.content.compactMap(\.text).joined(separator: "\n")
-            return JSONRPCResponse(
+            return encodeDirectError(
                 id: id,
                 error: JSONRPCError(code: -32001, message: errMessage.isEmpty ? "Resource unavailable" : errMessage)
             )
@@ -293,35 +386,31 @@ public actor MCPServerSession {
                 text: textContent
             )
         ])
-        return encodeResult(id: id, value: readResult)
+        return encodeDirectSuccess(id: id, result: readResult)
     }
 
     // MARK: - Prompts
 
-    private func handlePromptsList(id: JSONRPCID) -> JSONRPCResponse {
-        encodeResult(id: id, value: MCPPromptsListResult(prompts: promptCatalog.definitions))
-    }
-
-    private func handlePromptsGet(id: JSONRPCID, params: JSONValue?) -> JSONRPCResponse {
+    private func handlePromptsGet(id: JSONRPCID, params: JSONValue?) -> Data? {
         guard let params else {
-            return JSONRPCResponse(id: id, error: .invalidParams("Missing params for prompts/get"))
+            return encodeDirectError(id: id, error: .invalidParams("Missing params for prompts/get"))
         }
 
         let getParams: MCPGetPromptParams
         do {
-            getParams = try JSONValueBridge.fromJSONValue(params, as: MCPGetPromptParams.self)
+            getParams = try decodeParams(params, as: MCPGetPromptParams.self)
         } catch {
-            return JSONRPCResponse(id: id, error: .invalidParams(error.localizedDescription))
+            return encodeDirectError(id: id, error: .invalidParams(error.localizedDescription))
         }
 
         guard let promptResult = promptCatalog.getPrompt(
             name: getParams.name,
             arguments: getParams.arguments ?? [:]
         ) else {
-            return JSONRPCResponse(id: id, error: .invalidParams("Unknown prompt: \(getParams.name)"))
+            return encodeDirectError(id: id, error: .invalidParams("Unknown prompt: \(getParams.name)"))
         }
 
-        return encodeResult(id: id, value: promptResult)
+        return encodeDirectSuccess(id: id, result: promptResult)
     }
 
     // MARK: - Shared Guarded Tool Execution
@@ -334,78 +423,97 @@ public actor MCPServerSession {
     ) async -> MCPCallToolResult {
         let argsValue = JSONValue.object(arguments)
         let argsSummary = argsValue.compactDescription
-        let argsJSON = prettyJSONString(argsValue)
-        let startTime = Date()
+        let argsDetail = argsValue.detailedPreview(maxLength: 1400)
+        let argsJSON = compactJSONString(argsValue)
+        let startInstant = ContinuousClock.now
+        let currentClient = clientInfo.displayLabel
 
         // 0. Global Shield Mode ("Mode Bouclier") blocks all AI actions immediately.
         if settings.isShieldModeActive {
             let message = "MacP est en Mode Bouclier (pause globale activée par l'utilisateur)."
-            await auditLogger.record(AuditEntry(
-                clientName: clientInfo.displayLabel,
+            await recordAudit(
+                clientName: currentClient,
                 method: method,
-                toolName: displayTarget,
-                argumentsSummary: argsSummary,
-                argumentsJSON: argsJSON,
+                target: displayTarget,
+                argsSummary: argsSummary,
+                argsJSON: argsJSON,
                 outcome: .denied,
-                durationMs: elapsedMs(since: startTime),
+                since: startInstant,
                 detail: "Bloqué par le Mode Bouclier",
-                resultPreview: message
-            ))
+                resultPreview: message,
+                responseBytes: message.utf8.count
+            )
             return .failure(message)
         }
 
         // 1. Check UserDefaults toggle from the Bento Dashboard.
         guard settings.isToolEnabled(tool.name) else {
             let message = "Outil '\(tool.name)' désactivé par l'utilisateur dans MacP."
-            await auditLogger.record(AuditEntry(
-                clientName: clientInfo.displayLabel,
+            await recordAudit(
+                clientName: currentClient,
                 method: method,
-                toolName: displayTarget,
-                argumentsSummary: argsSummary,
-                argumentsJSON: argsJSON,
+                target: displayTarget,
+                argsSummary: argsSummary,
+                argsJSON: argsJSON,
                 outcome: .denied,
-                durationMs: elapsedMs(since: startTime),
+                since: startInstant,
                 detail: "Désactivé dans le Dashboard",
-                resultPreview: message
-            ))
+                resultPreview: message,
+                responseBytes: message.utf8.count
+            )
             return .failure(message)
         }
 
-        // 2. Check granular user permission policy (NSAlert for sensitive/critical tools).
+        // 2. Check granular user permission policy (serialized NSAlert for sensitive/critical tools).
         let authorized = await permissionManager.authorize(
             toolName: tool.name,
             toolDisplayName: tool.displayName,
             sensitivity: tool.sensitivity,
             reason: tool.permissionReason,
-            clientName: clientInfo.displayLabel,
-            argumentsSummary: argsSummary
+            clientName: currentClient,
+            argumentsSummary: argsSummary,
+            argumentsDetail: argsDetail
         )
+
+        if Task.isCancelled {
+            return .failure("Requête annulée par le client MCP.")
+        }
 
         guard authorized else {
             let message = "Exécution de '\(tool.name)' refusée par l'utilisateur."
-            await auditLogger.record(AuditEntry(
-                clientName: clientInfo.displayLabel,
+            await recordAudit(
+                clientName: currentClient,
                 method: method,
-                toolName: displayTarget,
-                argumentsSummary: argsSummary,
-                argumentsJSON: argsJSON,
+                target: displayTarget,
+                argsSummary: argsSummary,
+                argsJSON: argsJSON,
                 outcome: .denied,
-                durationMs: elapsedMs(since: startTime),
+                since: startInstant,
                 detail: "Refusé par l'utilisateur",
-                resultPreview: message
-            ))
+                resultPreview: message,
+                responseBytes: message.utf8.count
+            )
             return .failure(message)
         }
 
         // 3. Execute the native macOS tool.
         do {
             let toolResult = try await tool.execute(arguments: arguments)
-            let duration = elapsedMs(since: startTime)
+            if Task.isCancelled {
+                return .failure("Requête annulée par le client MCP.")
+            }
+
+            var totalBytes = 0
             let combinedText = toolResult.content
-                .map { block in
-                    if let text = block.text { return text }
+                .map { block -> String in
+                    if let text = block.text {
+                        totalBytes += text.utf8.count
+                        return text
+                    }
                     if block.type == "image" {
-                        return "[Image \(block.mimeType ?? "image") : \(block.data?.count ?? 0) chars base64]"
+                        let base64Count = block.data?.utf8.count ?? 0
+                        totalBytes += base64Count
+                        return "[Image \(block.mimeType ?? "image") : \(base64Count) chars base64]"
                     }
                     return "[\(block.type)]"
                 }
@@ -418,54 +526,94 @@ public actor MCPServerSession {
                 ? String(combinedText.prefix(3997)) + "..."
                 : combinedText
 
-            await auditLogger.record(AuditEntry(
-                clientName: clientInfo.displayLabel,
+            await recordAudit(
+                clientName: currentClient,
                 method: method,
-                toolName: displayTarget,
-                argumentsSummary: argsSummary,
-                argumentsJSON: argsJSON,
+                target: displayTarget,
+                argsSummary: argsSummary,
+                argsJSON: argsJSON,
                 outcome: toolResult.isError ? .error : .success,
-                durationMs: duration,
+                since: startInstant,
                 detail: shortDetail,
-                resultPreview: preview
-            ))
+                resultPreview: preview,
+                responseBytes: totalBytes
+            )
 
             return toolResult
+        } catch is CancellationError {
+            return .failure("Requête annulée par le client MCP.")
         } catch {
-            let duration = elapsedMs(since: startTime)
             let errMsg = "Erreur lors de l'exécution de '\(tool.name)' : \(error.localizedDescription)"
-            await auditLogger.record(AuditEntry(
-                clientName: clientInfo.displayLabel,
+            await recordAudit(
+                clientName: currentClient,
                 method: method,
-                toolName: displayTarget,
-                argumentsSummary: argsSummary,
-                argumentsJSON: argsJSON,
+                target: displayTarget,
+                argsSummary: argsSummary,
+                argsJSON: argsJSON,
                 outcome: .error,
-                durationMs: duration,
+                since: startInstant,
                 detail: error.localizedDescription,
-                resultPreview: errMsg
-            ))
+                resultPreview: errMsg,
+                responseBytes: errMsg.utf8.count
+            )
             return .failure(errMsg)
         }
     }
 
-    private func encodeResult<T: Encodable>(id: JSONRPCID, value: T) -> JSONRPCResponse {
+    // MARK: - Helpers
+
+    private func recordAudit(
+        clientName: String,
+        method: String,
+        target: String,
+        argsSummary: String,
+        argsJSON: String,
+        outcome: AuditOutcome,
+        since start: ContinuousClock.Instant,
+        detail: String,
+        resultPreview: String,
+        responseBytes: Int
+    ) async {
+        await auditLogger.record(AuditEntry(
+            clientName: clientName,
+            method: method,
+            toolName: target,
+            argumentsSummary: argsSummary,
+            argumentsJSON: argsJSON,
+            outcome: outcome,
+            durationMs: elapsedMs(since: start),
+            detail: detail,
+            resultPreview: resultPreview,
+            responseBytes: responseBytes
+        ))
+    }
+
+    private func decodeParams<T: Decodable>(_ value: JSONValue, as type: T.Type) throws -> T {
+        let data = try encoder.encode(value)
+        return try decoder.decode(type, from: data)
+    }
+
+    private func encodeDirectSuccess<Result: Encodable & Sendable>(id: JSONRPCID, result: Result) -> Data? {
         do {
-            let jsonVal = try JSONValueBridge.toJSONValue(value)
-            return JSONRPCResponse(id: id, result: jsonVal)
+            return try JSONRPCCodec.encodeResponseLine(id: id, result: result, using: encoder)
         } catch {
-            return JSONRPCResponse(id: id, error: .internalError(error.localizedDescription))
+            return encodeDirectError(id: id, error: .internalError(error.localizedDescription))
         }
     }
 
-    private func prettyJSONString(_ value: JSONValue) -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+    private func encodeDirectError(id: JSONRPCID, error: JSONRPCError) -> Data? {
+        try? JSONRPCCodec.encodeErrorLine(id: id, error: error, using: encoder)
+    }
+
+    private func compactJSONString(_ value: JSONValue) -> String {
         guard let data = try? encoder.encode(value) else { return "{}" }
         return String(decoding: data, as: UTF8.self)
     }
 
-    private func elapsedMs(since start: Date) -> Int {
-        max(0, Int((Date().timeIntervalSince(start) * 1000.0).rounded()))
+    private func elapsedMs(since start: ContinuousClock.Instant) -> Int {
+        let duration = start.duration(to: .now)
+        let ms = Double(duration.components.seconds) * 1000.0
+            + Double(duration.components.attoseconds) / 1_000_000_000_000_000.0
+        return max(0, Int(ms.rounded()))
     }
 }

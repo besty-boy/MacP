@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Live state snapshot published by `MacPBridgeService` to the SwiftUI Menu Bar Dashboard.
 public struct BridgeSnapshot: Sendable, Equatable {
@@ -38,7 +39,10 @@ public actor MacPBridgeService {
     public let auditLogger: AuditLogger
     public let socketPath: String
 
-    private var socketServer: UnixSocketServer?
+    /// Held behind a lightweight lock so `stopSync()` can immediately close and unlink `macp.sock`
+    /// during `NSApplicationDelegate.applicationWillTerminate` without waiting on async tasks.
+    private let activeServerLock = OSAllocatedUnfairLock<UnixSocketServer?>(initialState: nil)
+
     private var sessions: [UUID: MCPServerSession] = [:]
     private var clients: [UUID: ConnectedClientInfo] = [:]
     private var isListening = false
@@ -72,7 +76,7 @@ public actor MacPBridgeService {
             try server.start { [weak self] clientID, transport in
                 await self?.handleClientConnection(clientID: clientID, transport: transport)
             }
-            self.socketServer = server
+            activeServerLock.withLock { $0 = server }
             self.isListening = true
             self.lastError = nil
         } catch {
@@ -84,9 +88,18 @@ public actor MacPBridgeService {
         publishSnapshot()
     }
 
+    /// Synchronously closes and unlinks the Unix domain socket. Safe to invoke from `applicationWillTerminate`.
+    public nonisolated func stopSync() {
+        let server = activeServerLock.withLock { current -> UnixSocketServer? in
+            let s = current
+            current = nil
+            return s
+        }
+        server?.stopSync()
+    }
+
     public func stop() {
-        socketServer?.stop()
-        socketServer = nil
+        stopSync()
         isListening = false
         sessions.removeAll()
         clients.removeAll()
@@ -120,9 +133,13 @@ public actor MacPBridgeService {
     public func notifyToolsChanged() async {
         publishSnapshot()
         let activeSessions = Array(sessions.values)
-        for session in activeSessions {
-            await session.sendToolsListChangedNotification()
-            await session.sendResourcesListChangedNotification()
+        await withTaskGroup(of: Void.self) { group in
+            for session in activeSessions {
+                group.addTask {
+                    await session.sendToolsListChangedNotification()
+                    await session.sendResourcesListChangedNotification()
+                }
+            }
         }
     }
 

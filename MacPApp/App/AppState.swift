@@ -4,15 +4,25 @@ import MacPCore
 import Observation
 import UniformTypeIdentifiers
 
-/// Central `@MainActor` observable view model powering MacP V2 Dashboard, Tools, Clients, and Audit Inspector.
+struct ClientBannerMessage: Equatable {
+    let text: String
+    let isError: Bool
+}
+
+/// Central `@MainActor` observable view model powering MacP Dashboard, Tools, Clients, and Audit Inspector.
 @MainActor
 @Observable
 final class AppState {
     let registry: MCPToolRegistry
+    let resourceCatalog: MCPResourceCatalog
+    let promptCatalog: MCPPromptCatalog
     let settings: ToolSettingsStore
     let auditLogger: AuditLogger
     let permissionManager: PermissionManager
     let bridgeService: MacPBridgeService
+
+    let tools: [MCPToolMetadata]
+    let promptsCount: Int
 
     private(set) var snapshot: BridgeSnapshot = BridgeSnapshot()
     private(set) var liveTelemetry: SystemStatsTool.SystemStatsPayload?
@@ -27,17 +37,26 @@ final class AppState {
     private(set) var launchAtLoginEnabled: Bool = false
     private(set) var launchAtLoginMessage: String?
     private(set) var copiedConfigFeedback = false
-    private(set) var clientActionBanner: String?
+    private(set) var clientActionBanner: ClientBannerMessage?
+    private(set) var estimatedContextTokens: Int = 0
+    private(set) var enabledResourcesCount: Int = 0
 
+    var selectedAuditEntryID: UUID?
+
+    private var isPopoverVisible = false
+    private var isOverviewTabSelected = true
     private var snapshotTask: Task<Void, Never>?
     private var auditTask: Task<Void, Never>?
     private var telemetryTask: Task<Void, Never>?
     private var copyResetTask: Task<Void, Never>?
     private var bannerResetTask: Task<Void, Never>?
     private var hasStarted = false
+    private let toolSensitivityByName: [String: ToolSensitivity]
 
     init() {
         let registry = MCPToolRegistry.defaultMacOSTools()
+        let resourceCatalog = MCPResourceCatalog()
+        let promptCatalog = MCPPromptCatalog()
         let settings = ToolSettingsStore()
         let auditLogger = AuditLogger()
         let permissionManager = PermissionManager(
@@ -46,16 +65,23 @@ final class AppState {
         )
         let bridgeService = MacPBridgeService(
             registry: registry,
+            resourceCatalog: resourceCatalog,
+            promptCatalog: promptCatalog,
             settings: settings,
             permissionManager: permissionManager,
             auditLogger: auditLogger
         )
 
         self.registry = registry
+        self.resourceCatalog = resourceCatalog
+        self.promptCatalog = promptCatalog
         self.settings = settings
         self.auditLogger = auditLogger
         self.permissionManager = permissionManager
         self.bridgeService = bridgeService
+        self.tools = registry.allMetadata
+        self.promptsCount = promptCatalog.definitions.count
+        self.toolSensitivityByName = Dictionary(uniqueKeysWithValues: registry.allMetadata.map { ($0.name, $0.sensitivity) })
         self.isShieldModeActive = settings.isShieldModeActive
 
         refreshToolStates()
@@ -63,18 +89,41 @@ final class AppState {
         refreshLaunchAtLogin()
     }
 
-    var tools: [MCPToolMetadata] {
-        registry.allMetadata
-    }
-
     var activeToolsCount: Int {
         guard !isShieldModeActive else { return 0 }
-        return tools.filter { isToolEnabled($0.name) }.count
+        return tools.reduce(0) { $0 + (isToolEnabled($1.name) ? 1 : 0) }
     }
 
     var activeGrantsCount: Int {
-        let permanent = tools.filter { isAlwaysAllowed($0.name) }.count
+        let permanent = tools.reduce(0) { $0 + (isAlwaysAllowed($1.name) ? 1 : 0) }
         return permanent + temporaryGrants.count
+    }
+
+    var activePreset: ToolPreset? {
+        for preset in ToolPreset.allCases {
+            let matches = tools.allSatisfy { tool in
+                isToolEnabled(tool.name) == preset.isToolIncluded(tool.name, category: tool.category)
+            }
+            if matches {
+                return preset
+            }
+        }
+        return nil
+    }
+
+    func toolTokenCost(_ toolName: String) -> Int {
+        registry.estimatedSchemaTokens(forToolNamed: toolName)
+    }
+
+    func enabledCount(in category: ToolCategory) -> Int {
+        tools.reduce(0) { count, tool in
+            guard tool.category == category, isToolEnabled(tool.name) else { return count }
+            return count + 1
+        }
+    }
+
+    func totalCount(in category: ToolCategory) -> Int {
+        tools.reduce(0) { $0 + ($1.category == category ? 1 : 0) }
     }
 
     // MARK: - Lifecycle
@@ -110,41 +159,66 @@ final class AppState {
                     self.allEntries.removeLast(self.allEntries.count - 500)
                 }
                 self.recentEntries = Array(self.allEntries.prefix(5))
-                self.refreshToolStates()
-                await self.refreshTemporaryGrants()
+
+                // Only reload permission state when a non-standard tool ran (avoids redundant UserDefaults reads).
+                if let toolName = newEntry.toolName,
+                   self.toolSensitivityByName[toolName] != .standard {
+                    self.refreshPermissionStatesOnly()
+                    await self.refreshTemporaryGrants()
+                }
             }
         }
     }
 
-    func stop() {
+    /// Synchronous shutdown safe for `NSApplicationDelegate.applicationWillTerminate`.
+    func stopSync() {
         snapshotTask?.cancel()
         auditTask?.cancel()
         telemetryTask?.cancel()
         copyResetTask?.cancel()
         bannerResetTask?.cancel()
+        bridgeService.stopSync()
+    }
+
+    func stop() {
+        stopSync()
         let service = bridgeService
         Task {
             await service.stop()
         }
     }
 
-    /// Starts live CPU/RAM/Battery/Disk polling ONLY while the Menu Bar popover is visible (zero idle battery drain).
-    func startLiveTelemetry() {
-        telemetryTask?.cancel()
-        telemetryTask = Task { [weak self] in
-            while !Task.isCancelled {
-                let stats = await SystemStatsTool.collectSnapshot()
-                guard let self, !Task.isCancelled else { break }
-                self.liveTelemetry = stats
-                await self.refreshTemporaryGrants()
-                try? await Task.sleep(for: .seconds(3))
-            }
+    func setPopoverVisible(_ visible: Bool) {
+        isPopoverVisible = visible
+        updateTelemetryPollingState()
+        if visible {
+            Task { await refreshTemporaryGrants() }
         }
     }
 
-    func stopLiveTelemetry() {
-        telemetryTask?.cancel()
-        telemetryTask = nil
+    func setOverviewTabSelected(_ selected: Bool) {
+        isOverviewTabSelected = selected
+        updateTelemetryPollingState()
+    }
+
+    /// Runs live CPU/RAM/Battery/Disk polling ONLY when the Menu Bar popover is open AND the Overview tab is active.
+    private func updateTelemetryPollingState() {
+        let shouldPoll = isPopoverVisible && isOverviewTabSelected
+        if shouldPoll {
+            guard telemetryTask == nil else { return }
+            telemetryTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    let stats = await SystemStatsTool.collectSnapshot()
+                    guard let self, !Task.isCancelled else { break }
+                    self.liveTelemetry = stats
+                    await self.refreshTemporaryGrants()
+                    try? await Task.sleep(for: .seconds(3))
+                }
+            }
+        } else {
+            telemetryTask?.cancel()
+            telemetryTask = nil
+        }
     }
 
     // MARK: - Shield Mode & Tool Controls
@@ -152,6 +226,7 @@ final class AppState {
     func setShieldMode(_ active: Bool) {
         settings.isShieldModeActive = active
         isShieldModeActive = active
+        recomputeDerivedMetrics()
         Task {
             await bridgeService.notifyToolsChanged()
         }
@@ -164,6 +239,18 @@ final class AppState {
     func setToolEnabled(_ toolName: String, enabled: Bool) {
         settings.setToolEnabled(toolName, enabled: enabled)
         toolEnabledStates[toolName] = enabled
+        recomputeDerivedMetrics()
+        Task {
+            await bridgeService.notifyToolsChanged()
+        }
+    }
+
+    func applyPreset(_ preset: ToolPreset) {
+        settings.applyPreset(preset, to: tools)
+        for tool in tools {
+            toolEnabledStates[tool.name] = preset.isToolIncluded(tool.name, category: tool.category)
+        }
+        recomputeDerivedMetrics()
         Task {
             await bridgeService.notifyToolsChanged()
         }
@@ -211,7 +298,7 @@ final class AppState {
     func revokeAllPermissions() {
         let names = tools.map(\.name)
         settings.revokeAllPermissions(for: names)
-        refreshToolStates()
+        refreshPermissionStatesOnly()
         Task {
             await permissionManager.revokeAllGrants(for: names)
             await refreshTemporaryGrants()
@@ -222,6 +309,9 @@ final class AppState {
         var enabledMap: [String: Bool] = [:]
         var allowedMap: [String: Bool] = [:]
         var policyMap: [String: ToolPermissionPolicy] = [:]
+        enabledMap.reserveCapacity(tools.count)
+        allowedMap.reserveCapacity(tools.count)
+        policyMap.reserveCapacity(tools.count)
         for tool in tools {
             enabledMap[tool.name] = settings.isToolEnabled(tool.name)
             allowedMap[tool.name] = settings.isAlwaysAllowed(tool.name)
@@ -233,6 +323,21 @@ final class AppState {
         toolEnabledStates = enabledMap
         toolAlwaysAllowedStates = allowedMap
         toolPolicies = policyMap
+        recomputeDerivedMetrics()
+    }
+
+    private func refreshPermissionStatesOnly() {
+        var allowedMap: [String: Bool] = [:]
+        allowedMap.reserveCapacity(tools.count)
+        for tool in tools {
+            allowedMap[tool.name] = settings.isAlwaysAllowed(tool.name)
+        }
+        toolAlwaysAllowedStates = allowedMap
+    }
+
+    private func recomputeDerivedMetrics() {
+        estimatedContextTokens = registry.estimatedSchemaTokens(enabledUsing: settings)
+        enabledResourcesCount = resourceCatalog.definitions(enabledUsing: settings, registry: registry).count
     }
 
     private func refreshTemporaryGrants() async {
@@ -240,6 +345,23 @@ final class AppState {
     }
 
     // MARK: - 1-Click MCP Client Config & Launch at Login
+
+    var orderedClients: [SupportedMCPClient] {
+        SupportedMCPClient.allCases.sorted { lhs, rhs in
+            let lScore = clientSortScore(lhs)
+            let rScore = clientSortScore(rhs)
+            if lScore != rScore { return lScore > rScore }
+            return lhs.displayName < rhs.displayName
+        }
+    }
+
+    private func clientSortScore(_ client: SupportedMCPClient) -> Int {
+        switch clientStatuses[client] {
+        case .configured: return 3
+        case .outdatedPath: return 2
+        default: return client.isLikelyInstalled ? 1 : 0
+        }
+    }
 
     func refreshClientStatuses() {
         var statuses: [SupportedMCPClient: ClientConfigStatus] = [:]
@@ -253,9 +375,9 @@ final class AppState {
         do {
             try MCPClientConfigManager.installOrUpdate(client: client)
             refreshClientStatuses()
-            showClientBanner("\(client.displayName) configuré ! Redémarrez le client pour activer MacP.")
+            showClientBanner("\(client.displayName) configuré ! Redémarrez le client pour activer MacP.", isError: false)
         } catch {
-            showClientBanner("Erreur \(client.displayName) : \(error.localizedDescription)")
+            showClientBanner("Erreur \(client.displayName) : \(error.localizedDescription)", isError: true)
         }
     }
 
@@ -263,9 +385,21 @@ final class AppState {
         do {
             try MCPClientConfigManager.remove(client: client)
             refreshClientStatuses()
-            showClientBanner("MacP retiré de \(client.displayName).")
+            showClientBanner("MacP retiré de \(client.displayName).", isError: false)
         } catch {
-            showClientBanner("Erreur \(client.displayName) : \(error.localizedDescription)")
+            showClientBanner("Erreur \(client.displayName) : \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    func revealClientConfig(_ client: SupportedMCPClient) {
+        let url = client.configFileURL
+        if FileManager.default.fileExists(atPath: url.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            let folder = url.deletingLastPathComponent()
+            if FileManager.default.fileExists(atPath: folder.path) {
+                NSWorkspace.shared.open(folder)
+            }
         }
     }
 
@@ -284,11 +418,11 @@ final class AppState {
         }
     }
 
-    private func showClientBanner(_ message: String) {
-        clientActionBanner = message
+    private func showClientBanner(_ message: String, isError: Bool) {
+        clientActionBanner = ClientBannerMessage(text: message, isError: isError)
         bannerResetTask?.cancel()
         bannerResetTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(4))
+            try? await Task.sleep(for: .seconds(4.5))
             guard !Task.isCancelled else { return }
             self?.clientActionBanner = nil
         }
@@ -301,6 +435,7 @@ final class AppState {
             await auditLogger.clear()
             self.allEntries.removeAll()
             self.recentEntries.removeAll()
+            self.selectedAuditEntryID = nil
         }
     }
 
@@ -366,7 +501,7 @@ final class AppState {
     }
 
     func quitApp() {
-        stop()
+        stopSync()
         NSApp.terminate(nil)
     }
 }
